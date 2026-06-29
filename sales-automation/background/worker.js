@@ -649,13 +649,15 @@
         const headerCount = headers.length;
         const alignedCells = (r2) => {
           let cells = [...r2.querySelectorAll('td,[role="cell"],[role="gridcell"]')];
-          while (cells.length > headerCount && cells.length > 0) {
+          while (cells.length > 0) {
             const c0 = cells[0];
-            const t0 = (c0.textContent ?? "").trim();
-            if (c0.querySelector('input[type="checkbox"]') || /^select row$/i.test(t0) || t0 === "") cells = cells.slice(1);
-            else break;
+            if (c0.querySelector('input[type="checkbox"]') || /^select row$/i.test((c0.textContent ?? "").trim())) {
+              cells = cells.slice(1);
+              continue;
+            }
+            break;
           }
-          if (cells.length > headerCount) cells = cells.slice(cells.length - headerCount);
+          if (cells.length > headerCount) cells = cells.slice(0, headerCount);
           return cells;
         };
         const rawCellCounts = sample.slice(0, 3).map((r2) => r2.querySelectorAll('td,[role="cell"],[role="gridcell"]').length);
@@ -1129,13 +1131,15 @@
         };
         const alignedCells = (r) => {
           let cells = [...r.querySelectorAll('td, [role="cell"], [role="gridcell"]')];
-          while (cells.length > headerCount && cells.length > 0) {
+          while (cells.length > 0) {
             const c0 = cells[0];
-            const t0 = (c0.textContent ?? "").trim();
-            if (c0.querySelector('input[type="checkbox"]') || /^select row$/i.test(t0) || t0 === "") cells = cells.slice(1);
-            else break;
+            if (c0.querySelector('input[type="checkbox"]') || /^select row$/i.test((c0.textContent ?? "").trim())) {
+              cells = cells.slice(1);
+              continue;
+            }
+            break;
           }
-          if (cells.length > headerCount) cells = cells.slice(cells.length - headerCount);
+          if (cells.length > headerCount) cells = cells.slice(0, headerCount);
           return cells;
         };
         const clean = (s) => {
