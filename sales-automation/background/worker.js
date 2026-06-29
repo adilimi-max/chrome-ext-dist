@@ -777,6 +777,8 @@
     let total = null;
     let raw = "";
     let pageFromText = null;
+    let currentlyOnPage = null;
+    let maxPage = null;
     for (const t of pagerTexts) {
       if (rangeStart == null) {
         const m = t.match(RANGE_RE);
@@ -792,6 +794,12 @@
           }
         }
       }
+      const cm = t.match(/currently on page\s+(\d+)/i);
+      if (cm && currentlyOnPage == null) currentlyOnPage = toInt(cm[1]);
+      for (const pm of t.matchAll(/page\s+(\d+)/gi)) {
+        const n = toInt(pm[1]);
+        if (n != null) maxPage = maxPage == null ? n : Math.max(maxPage, n);
+      }
       if (pageFromText == null) {
         const pm = t.match(PAGE_RE);
         if (pm) pageFromText = toInt(pm[1]);
@@ -802,14 +810,23 @@
       pageSize = rangeEnd - rangeStart + 1;
       if (pageSize <= 0) pageSize = null;
     }
+    let totalPages = null;
+    if (currentlyOnPage != null && maxPage != null) {
+      totalPages = maxPage;
+    } else if (total != null && pageSize != null && pageSize > 0) {
+      totalPages = Math.ceil(total / pageSize);
+    }
     let page = null;
     let source = "none";
     let confident = false;
     if (rangeStart != null && pageSize != null) {
       source = "range";
       confident = true;
-      page = Math.floor((rangeStart - 1) / pageSize) + 1;
-      if (pageFromText != null) page = pageFromText;
+      page = pageFromText ?? currentlyOnPage ?? Math.floor((rangeStart - 1) / pageSize) + 1;
+    } else if (currentlyOnPage != null && maxPage != null) {
+      page = currentlyOnPage;
+      source = "page-nav";
+      confident = true;
     } else if (pageFromText != null) {
       page = pageFromText;
       source = "range";
@@ -823,7 +840,7 @@
         confident = false;
       }
     }
-    return { page, rangeStart, rangeEnd, total, pageSize, raw, source, confident };
+    return { page, totalPages, rangeStart, rangeEnd, total, pageSize, raw, source, confident };
   }
   function classifyHarvestMode(p) {
     const scrolled = p.scrollTopAfter > p.scrollTopBefore + 2;
@@ -882,20 +899,26 @@
     };
   }
   function advanceVerdict(before, after, pageSize) {
-    if (before.rangeEnd != null && before.total != null && before.rangeEnd === before.total) {
-      return { kind: "last-page" };
+    if (isLastPage(before)) return { kind: "last-page" };
+    if (before.rangeStart != null && after.rangeStart != null) {
+      const moved = after.rangeStart - before.rangeStart;
+      if (moved <= 0) return { kind: "no-move" };
+      const size = pageSize ?? before.pageSize ?? after.pageSize ?? DEFAULT_PAGE_SIZE;
+      if (moved === size) return { kind: "advanced", newRangeStart: after.rangeStart };
+      return { kind: "skipped", jumpedBy: moved };
     }
-    if (before.rangeStart == null || after.rangeStart == null) {
-      return { kind: "no-move" };
+    if (before.page != null && after.page != null) {
+      const moved = after.page - before.page;
+      if (moved <= 0) return { kind: "no-move" };
+      if (moved === 1) return { kind: "advanced", newRangeStart: after.rangeStart ?? after.page };
+      return { kind: "skipped", jumpedBy: moved };
     }
-    const moved = after.rangeStart - before.rangeStart;
-    if (moved <= 0) return { kind: "no-move" };
-    const size = pageSize ?? before.pageSize ?? after.pageSize ?? DEFAULT_PAGE_SIZE;
-    if (moved === size) return { kind: "advanced", newRangeStart: after.rangeStart };
-    return { kind: "skipped", jumpedBy: moved };
+    return { kind: "no-move" };
   }
   function isLastPage(p) {
-    return p.rangeEnd != null && p.total != null && p.rangeEnd === p.total;
+    if (p.rangeEnd != null && p.total != null && p.rangeEnd === p.total) return true;
+    if (p.page != null && p.totalPages != null && p.page >= p.totalPages) return true;
+    return false;
   }
   function chooseBatchSize(o) {
     const floor = o.floor ?? RESEARCH_BATCH_FLOOR;
@@ -2022,10 +2045,15 @@
         };
         const pagerText = () => {
           const out = [];
+          const pagerSel = '[data-test-id*="pagination"], [class*="pagination" i], [aria-label*="pagination" i], nav[role="navigation"], [class*="pager" i]';
+          for (const el of document.querySelectorAll(pagerSel)) {
+            const t = (el.textContent ?? "").replace(/\s+/g, " ").trim();
+            if (t && t.length <= 120) out.push(t);
+          }
           for (const el of document.querySelectorAll("span, div, p")) {
             if (el.children.length > 0) continue;
             const t = (el.textContent ?? "").replace(/\s+/g, " ").trim();
-            if (t.length > 0 && t.length <= 60 && (/\bof\b/i.test(t) || /page\s+\d/i.test(t)) && /\d/.test(t)) out.push(t);
+            if (t.length > 0 && t.length <= 120 && (/\bof\b/i.test(t) || /page\s+\d/i.test(t) || /currently on page/i.test(t)) && /\d/.test(t)) out.push(t);
           }
           return [...new Set(out)].slice(0, 12);
         };
@@ -2410,7 +2438,7 @@
     }
     const fullyRendered = mode === "all-rendered" || mode === "classic-paginated";
     const learnedPageSize = fullyRendered && pager.pageSize ? pager.pageSize : state.expectedPageSize;
-    const expectedPageSize = learnedPageSize ?? DEFAULT_PAGE_SIZE;
+    const expectedPageSize = learnedPageSize;
     const firstRowId = rows[0]?.objectId ?? "";
     const priorPage = state.hubspotPage;
     const priorPageFirstId = state.pageFirstId;
@@ -2500,7 +2528,7 @@
       const firstId = (await readListState(tab.id)).renderedRowIds[0] ?? "";
       const raw = await clickPagerVerified(tab.id, { page: before.page, rangeStart: before.rangeStart, firstId });
       const after = parsePageState(raw.pagerTexts, raw.pageInputValue);
-      const verdict = advanceVerdict(before, after, expectedPageSize);
+      const verdict = advanceVerdict(before, after, expectedPageSize ?? null);
       if (verdict.kind === "advanced") {
         const landed = await readListState(tab.id);
         const processedSet = new Set(state.processed);
