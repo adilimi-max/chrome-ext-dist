@@ -166,33 +166,60 @@
       }
     }
   }
+  var CONTACT_TOKEN = /\b(?:ceo|cfo|cto|coo|cmo|ciso|cio|vp|svp|evp|owner|founder|co-?founder|president|director|manager|officer|head\s+of|lead|reach|contact|email|call|ask\s+for|attn|mr|mrs|ms|dr)\b/i;
+  var PERSON_MARKER = /\b(?:ceo|cfo|cto|coo|cmo|ciso|cio|vp|svp|evp|owner|co-?founder|founder|mr|mrs|ms|dr)\b/i;
+  function looksLikeContactHint(s) {
+    return CONTACT_TOKEN.test(s);
+  }
+  function looksLikePersonName(s) {
+    return PERSON_MARKER.test(s);
+  }
   var RESEARCH_DOMAIN = /^(?=.{1,253}$)[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+$/i;
   var NAME_MAX_LEN = 80;
   var NAME_PHONE = /(?:\d[\s().-]*){7,}/;
   var NAME_CONTROL = /[\x00-\x1f\x7f]/;
   function assertResearchEgressSafe(payload) {
+    assertResearchItemSafe(payload);
+  }
+  function assertResearchItemSafe(payload, where = "research payload") {
     if (payload === null || typeof payload !== "object" || Array.isArray(payload)) {
-      throw new EgressViolationError("research payload must be a {name, domain} object");
+      throw new EgressViolationError(`${where} must be a {name, domain} object`);
     }
     const keys = Object.keys(payload).sort();
     if (keys.length !== 2 || keys[0] !== "domain" || keys[1] !== "name") {
-      throw new EgressViolationError(`research payload keys must be exactly {name, domain}, got {${keys.join(", ")}}`);
+      throw new EgressViolationError(`${where} keys must be exactly {name, domain}, got {${keys.join(", ")}}`);
     }
     const { name, domain } = payload;
-    if (typeof name !== "string") throw new EgressViolationError("research name must be a string");
+    if (typeof name !== "string") throw new EgressViolationError(`${where} name must be a string`);
     const n = name.replace(ZERO_WIDTH, "").trim();
-    if (n.length === 0) throw new EgressViolationError("research name is empty");
-    if (n.length > NAME_MAX_LEN) throw new EgressViolationError("research name too long (looks like a body)");
-    if (NAME_CONTROL.test(n)) throw new EgressViolationError("research name contains control chars/newlines");
-    if (EMAIL.test(n)) throw new EgressViolationError("research name is an email address");
-    if (NAME_PHONE.test(n)) throw new EgressViolationError("research name contains a phone number");
-    if (URL.test(n)) throw new EgressViolationError("research name is a URL");
-    if (DOMAIN.test(n)) throw new EgressViolationError("research name contains a domain");
-    if (wordCount(n) > 8) throw new EgressViolationError("research name is free text, not a company name");
-    if (typeof domain !== "string") throw new EgressViolationError("research domain must be a string");
+    if (n.length === 0) throw new EgressViolationError(`${where} name is empty`);
+    if (n.length > NAME_MAX_LEN) throw new EgressViolationError(`${where} name too long (looks like a body)`);
+    if (NAME_CONTROL.test(n)) throw new EgressViolationError(`${where} name contains control chars/newlines`);
+    if (EMAIL.test(n)) throw new EgressViolationError(`${where} name is an email address`);
+    if (NAME_PHONE.test(n)) throw new EgressViolationError(`${where} name contains a phone number`);
+    if (URL.test(n)) throw new EgressViolationError(`${where} name is a URL`);
+    if (DOMAIN.test(n)) throw new EgressViolationError(`${where} name contains a domain`);
+    if (wordCount(n) > 8) throw new EgressViolationError(`${where} name is free text, not a company name`);
+    if (looksLikePersonName(n)) {
+      throw new EgressViolationError(`${where} name carries a person/role marker (looks like a contact, not a company)`);
+    }
+    if (typeof domain !== "string") throw new EgressViolationError(`${where} domain must be a string`);
     const d = domain.replace(ZERO_WIDTH, "").trim();
-    if (d.includes("@")) throw new EgressViolationError("research domain is an email address");
-    if (!RESEARCH_DOMAIN.test(d)) throw new EgressViolationError("research domain is not a single bare domain token");
+    if (d.includes("@")) throw new EgressViolationError(`${where} domain is an email address`);
+    if (!RESEARCH_DOMAIN.test(d)) throw new EgressViolationError(`${where} domain is not a single bare domain token`);
+  }
+  var BATCH_MAX = 10;
+  function assertResearchBatchEgressSafe(payload) {
+    if (!Array.isArray(payload)) {
+      throw new EgressViolationError("research-batch payload must be an array of {name, domain}");
+    }
+    if (payload.length === 0) throw new EgressViolationError("research-batch payload is empty");
+    if (payload.length > BATCH_MAX) {
+      throw new EgressViolationError(`research-batch payload exceeds ${BATCH_MAX} items (got ${payload.length})`);
+    }
+    for (let i = 0; i < payload.length; i++) {
+      assertResearchItemSafe(payload[i], `research-batch item ${i + 1}`);
+    }
   }
 
   // src/shared/bridge.ts
@@ -230,7 +257,8 @@
     async function attempt(c, nonce, slotId) {
       if (c.egressPayload !== void 0) {
         try {
-          if (c.egressMode === "research") assertResearchEgressSafe(c.egressPayload);
+          if (c.egressMode === "research-batch") assertResearchBatchEgressSafe(c.egressPayload);
+          else if (c.egressMode === "research") assertResearchEgressSafe(c.egressPayload);
           else assertEgressSafe(c.egressPayload, c.egressTokens);
         } catch {
           return { ok: false, failure: "egress", nonce };
@@ -979,10 +1007,7 @@
   }
   var PLACEHOLDER = /^[.…\s]*$/;
   var isPlaceholder = (s) => s == null || PLACEHOLDER.test(s);
-  function parseResearch(inner) {
-    if (!/<response[\s>]/.test(inner) && !/<industry>|<sourced>|<fit>/.test(inner)) {
-      throw new SchemaError("missing research envelope");
-    }
+  function parseResearchFields(inner) {
     const industryRaw = tagLast(inner, "industry");
     const industry = industryRaw && !isPlaceholder(industryRaw) ? industryRaw.slice(0, NAME_TRUNC) : null;
     const employees = parseEmployees(tagLast(inner, "employees"));
@@ -1000,6 +1025,12 @@
       sourced: truthy(tagLast(inner, "sourced"))
     };
   }
+  function parseResearch(inner) {
+    if (!/<response[\s>]/.test(inner) && !/<industry>|<sourced>|<fit>/.test(inner)) {
+      throw new SchemaError("missing research envelope");
+    }
+    return parseResearchFields(inner);
+  }
   function makeResearchCall(payload) {
     const { name, domain, hints } = payload;
     const hintLines = [];
@@ -1008,7 +1039,7 @@
     }
     if (hints?.industry != null && hints.industry.trim() !== "") {
       const label = hints.industry.trim();
-      if (INDUSTRY_LABEL.test(label) && egressClears(label)) {
+      if (INDUSTRY_LABEL.test(label) && egressClears(label) && !looksLikeContactHint(label)) {
         hintLines.push(`Suspected industry label (verify): ${label}`);
       }
     }
@@ -1337,6 +1368,340 @@
       remaining,
       note: `Researched ${researched} thin account(s)${failed ? `, ${failed} failed (bridge timeout / no web result)` : ""}. ${reused} already cached. ${remaining} still queued \u2014 run again to continue. Then click "Preview sourcing" to see the re-ranked list.`
     };
+  }
+
+  // src/shared/sweep.ts
+  var RANK2 = { SKIP: 0, NURTURE: 1, WARM: 2, HOT: 3 };
+  function tierAtLeast(a, b) {
+    return RANK2[a] >= RANK2[b];
+  }
+  var ENTERPRISE_EMPLOYEE_CEILING = 5e3;
+  var TOO_TINY_EMPLOYEE_FLOOR = 5;
+  function worthResearching(input, currentTier) {
+    if (tierAtLeast(currentTier, "WARM")) return false;
+    const name = (input.name ?? "").trim();
+    const domain = (input.domain ?? "").trim();
+    if (name === "" || domain === "") return false;
+    const emp = input.employeeCount;
+    if (emp != null) {
+      if (emp > ENTERPRISE_EMPLOYEE_CEILING) return false;
+      if (emp < TOO_TINY_EMPLOYEE_FLOOR) return false;
+    }
+    return needsResearch(input);
+  }
+  function initSweepState(now) {
+    return {
+      active: true,
+      page: 0,
+      processed: [],
+      results: [],
+      consideredCount: 0,
+      researchedCount: 0,
+      startedAt: now,
+      done: false
+    };
+  }
+  var sweepKey = (a) => (a.objectId && a.objectId.trim() !== "" ? a.objectId : a.domain).trim();
+  var keyOf = sweepKey;
+  function recordResults(state, scored, fitBar = "WARM", processedKeys = []) {
+    const processed = new Set(state.processed);
+    const resultKeys = new Set(state.results.map(keyOf));
+    const researchedSeen = /* @__PURE__ */ new Set();
+    let newlyResearched = 0;
+    for (const r of scored) {
+      if (!r.researched) continue;
+      const k = keyOf(r);
+      if (k === "") continue;
+      if (processed.has(k) || researchedSeen.has(k)) continue;
+      researchedSeen.add(k);
+      newlyResearched += 1;
+    }
+    const results = [...state.results];
+    for (const r of scored) {
+      const k = keyOf(r);
+      if (k === "") continue;
+      if (!tierAtLeast(r.tier, fitBar)) continue;
+      if (resultKeys.has(k)) continue;
+      resultKeys.add(k);
+      results.push(r);
+    }
+    let newlyProcessed = 0;
+    for (const raw of processedKeys) {
+      const k = (raw ?? "").trim();
+      if (k === "" || processed.has(k)) continue;
+      processed.add(k);
+      newlyProcessed += 1;
+    }
+    return {
+      ...state,
+      processed: [...processed],
+      results,
+      consideredCount: state.consideredCount + newlyProcessed,
+      researchedCount: state.researchedCount + newlyResearched
+    };
+  }
+  function selectUnprocessed(candidates, processed, batchSize) {
+    const out = [];
+    for (const c of candidates) {
+      if (out.length >= batchSize) break;
+      const k = keyOf(c);
+      if (k === "" || processed.has(k)) continue;
+      out.push(c);
+    }
+    return out;
+  }
+
+  // src/prompts/research-companies.ts
+  var NOTE_MAX3 = 160;
+  var INDUSTRY_LABEL2 = /^[a-z0-9 ,&/-]{1,40}$/i;
+  function egressClears2(s) {
+    try {
+      assertEgressSafe(s);
+      return true;
+    } catch (e) {
+      if (e instanceof EgressViolationError) return false;
+      throw e;
+    }
+  }
+  function hintSuffix(hints) {
+    const parts = [];
+    if (hints?.employees != null && Number.isFinite(hints.employees)) {
+      parts.push(`~${Math.round(hints.employees)} employees`);
+    }
+    if (hints?.industry != null && hints.industry.trim() !== "") {
+      const label = hints.industry.trim();
+      if (INDUSTRY_LABEL2.test(label) && egressClears2(label) && !looksLikeContactHint(label)) {
+        parts.push(`industry: ${label}`);
+      }
+    }
+    return parts.length > 0 ? ` [hints \u2014 verify: ${parts.join("; ")}]` : "";
+  }
+  function makeBatchResearchCall(items) {
+    const expectedRefs = items.map((i) => i.ref);
+    const expectedSet = new Set(expectedRefs);
+    if (expectedSet.size !== items.length) {
+      throw new SchemaError("duplicate ref in batch INPUT");
+    }
+    for (let i = 0; i < items.length; i++) {
+      if (items[i].ref !== i + 1) {
+        throw new SchemaError(`batch INPUT refs must be contiguous 1..N (item ${i + 1} has ref ${items[i].ref})`);
+      }
+    }
+    return {
+      chatType: "analysis",
+      retryClass: "read",
+      promptName: "research-companies",
+      egressMode: "research-batch",
+      // ONLY {name, domain} per item leaves the box — refs are non-PII indices and never ride the payload.
+      egressPayload: items.map((i) => ({ name: i.name, domain: i.domain })),
+      render: (nonce) => [
+        "You are a B2B company researcher. Use WEB SEARCH to research EACH company below, then reply.",
+        "Assess each for fit as a mid-market CRM / marketing / sales platform customer (HubSpot-style ICP).",
+        "",
+        "Companies:",
+        ...items.map((i) => `Company ${i.ref}: ${i.name} (${i.domain})${hintSuffix(i.hints)}`),
+        "",
+        "Rules:",
+        "- USE WEB SEARCH for each company. Do not guess from the name alone.",
+        "- If you cannot find reliable information for a company, set its <sourced>false</sourced> and",
+        "  leave its unknown fields BLANK (empty tag). An honest blank beats a fabricated number.",
+        "- <fit> is an integer 1-10 (10 = ideal mid-market CRM/marketing/sales customer).",
+        "- <employees> is your best INTEGER headcount estimate.",
+        "- <industry> is a short industry label.",
+        '- <funding>, <hiring>, <expansion> are true/false "why now" signals.',
+        `- <note> is a SHORT why-now note, \u2264${NOTE_MAX3} characters, with NO names of individuals.`,
+        '- Output ONE <company ref="N"> block per input company, echoing its EXACT ref number.',
+        "- You MUST return a block for EVERY company ref listed above \u2014 no more, no fewer.",
+        "",
+        "Reply with EXACTLY this envelope and nothing else (one <company> block per input):",
+        `\xA7\xA7BEGIN ${nonce}\xA7\xA7`,
+        "<response>",
+        ...items.map(
+          (i) => `<company ref="${i.ref}"><industry>\u2026</industry><employees>\u2026</employees><fit>\u2026</fit><funding>true|false</funding><hiring>true|false</hiring><expansion>true|false</expansion><note>\u2026</note><sourced>true|false</sourced></company>`
+        ),
+        "</response>",
+        `\xA7\xA7END ${nonce}\xA7\xA7`
+      ].join("\n"),
+      parse: (inner) => parseBatch(inner, expectedSet)
+    };
+  }
+  var COMPANY_BLOCK = /<company\s+ref="(\d+)"\s*>([\s\S]*?)<\/company>/g;
+  var COMPANY_OPEN_TAG = /<company\b/gi;
+  var COMPANY_CLOSE_TAG = /<\/company\s*>/gi;
+  var countMatches = (s, re) => (s.match(re) ?? []).length;
+  function parseBatch(inner, expectedRefs) {
+    if (!/<response[\s>]/.test(inner) && !/<company\s+ref=/.test(inner)) {
+      throw new SchemaError("missing batch research envelope");
+    }
+    const items = [];
+    const seen = /* @__PURE__ */ new Set();
+    const blocks = [...inner.matchAll(COMPANY_BLOCK)];
+    if (countMatches(inner, COMPANY_OPEN_TAG) !== blocks.length || countMatches(inner, COMPANY_CLOSE_TAG) !== blocks.length) {
+      throw new SchemaError("stray <company>/</company> tag \u2014 a block body was truncated");
+    }
+    for (const m of blocks) {
+      const ref = Number(m[1]);
+      if (seen.has(ref)) throw new SchemaError(`duplicate ref ${ref} in batch reply`);
+      if (!expectedRefs.has(ref)) throw new SchemaError(`unexpected ref ${ref} not in batch input`);
+      seen.add(ref);
+      items.push({ ref, result: parseResearchFields(m[2]) });
+    }
+    if (items.length === 0) throw new SchemaError("no <company> blocks in batch reply");
+    if (seen.size !== expectedRefs.size) {
+      const missing = [...expectedRefs].filter((r) => !seen.has(r));
+      throw new SchemaError(`batch reply missing refs: ${missing.join(", ")}`);
+    }
+    items.sort((a, b) => a.ref - b.ref);
+    return items;
+  }
+
+  // src/background/sweep-engine.ts
+  var ALARM = "sweepTick";
+  var BATCH_SIZE = 8;
+  var BATCHES_PER_TICK = 3;
+  var dk = (d) => (d ?? "").trim().toLowerCase();
+  function toResult(o) {
+    const why = [...o.signals, o.researchNote ? `why-now: ${o.researchNote}` : ""].filter(Boolean).join(" \xB7 ") || "no scored signals";
+    return { objectId: o.objectId, name: o.name, domain: o.domain, tier: o.tier, score: o.score, why, researched: o.researched };
+  }
+  async function startSweep(storage2) {
+    const state = initSweepState(Date.now());
+    await storage2.set("sweepState", state);
+    chrome.alarms.create(ALARM, { periodInMinutes: 1 });
+    return state;
+  }
+  async function stopSweep(storage2) {
+    await chrome.alarms.clear(ALARM);
+    const cur = await storage2.getOr("sweepState", null);
+    if (!cur) return null;
+    const next = { ...cur, active: false };
+    await storage2.set("sweepState", next);
+    return next;
+  }
+  async function getSweep(storage2) {
+    return storage2.getOr("sweepState", null);
+  }
+  async function firstRowId(tabId) {
+    const [res] = await chrome.scripting.executeScript({
+      target: { tabId },
+      func: () => {
+        const a = document.querySelector('a[href*="/record/0-2/"], a[href*="/company/"]');
+        const m = (a?.getAttribute("href") ?? "").match(/(\d{5,})/);
+        return m ? m[1] : "";
+      }
+    });
+    return res?.result ?? "";
+  }
+  async function clickNextPage(tabId, prevFirstId) {
+    const [res] = await chrome.scripting.executeScript({
+      target: { tabId },
+      func: async (prev) => {
+        const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+        const firstId = () => {
+          const a = document.querySelector('a[href*="/record/0-2/"], a[href*="/company/"]');
+          const m = (a?.getAttribute("href") ?? "").match(/(\d{5,})/);
+          return m ? m[1] : "";
+        };
+        const btns = [...document.querySelectorAll('button, a[role="button"]')];
+        const enabled = (b) => !b.disabled && b.getAttribute("aria-disabled") !== "true";
+        const next = btns.find((b) => /next( page)?/i.test(b.getAttribute("aria-label") ?? "") && enabled(b)) ?? btns.find((b) => /^next$/i.test((b.textContent ?? "").trim()) && enabled(b));
+        if (!next) return false;
+        next.click();
+        for (let i = 0; i < 20; i++) {
+          await sleep(400);
+          const id = firstId();
+          if (id !== "" && id !== prev) return true;
+        }
+        return false;
+      },
+      args: [prevFirstId]
+    });
+    return res?.result === true;
+  }
+  async function sweepTick(bridge2, storage2) {
+    let state = await storage2.getOr("sweepState", null);
+    if (!state || !state.active || state.done) {
+      await chrome.alarms.clear(ALARM);
+      return;
+    }
+    const tab = await findHubspotTab2();
+    if (!tab?.id) return;
+    const rows = await scrapeRows(tab.id);
+    const dossier = await storage2.getOr("dossier", {});
+    const now = Date.now();
+    const mapped = rows.map(({ objectId, row }) => {
+      let { input } = mapAccount(row, objectId);
+      let researched = false;
+      const entry = dossier[dk(input.domain)];
+      if (isFresh(entry, now)) {
+        input = mergeResearch(input, entry.result).input;
+        researched = true;
+      }
+      return { objectId, input, result: scoreAccount(input), researched };
+    });
+    const nonResearch = mapped.filter((m) => !worthResearching(m.input, m.result.tier));
+    if (nonResearch.length) {
+      const results = nonResearch.map((m) => toResult({
+        objectId: m.objectId,
+        name: m.input.name ?? "(no name)",
+        domain: m.input.domain ?? "",
+        tier: m.result.tier,
+        score: m.result.score,
+        signals: m.result.signals,
+        researchNote: m.input.researchNote,
+        researched: m.researched
+      }));
+      const keys = nonResearch.map((m) => sweepKey({ objectId: m.objectId, domain: dk(m.input.domain) }));
+      state = recordResults(state, results, "WARM", keys);
+      await storage2.set("sweepState", state);
+    }
+    const researchable = mapped.filter((m) => worthResearching(m.input, m.result.tier)).map((m) => ({ objectId: m.objectId, domain: dk(m.input.domain), input: m.input }));
+    for (let b = 0; b < BATCHES_PER_TICK; b++) {
+      const batch = selectUnprocessed(researchable, new Set(state.processed), BATCH_SIZE);
+      if (batch.length === 0) break;
+      const items = batch.map((x, i) => ({
+        ref: i + 1,
+        name: x.input.name ?? "",
+        domain: x.input.domain ?? "",
+        hints: { industry: x.input.industry ?? x.input.industryAlt, employees: x.input.employeeCount }
+      }));
+      const res = await bridge2.call(makeBatchResearchCall(items));
+      const scored = [];
+      if (res.ok && Array.isArray(res.value)) {
+        for (const it of res.value) {
+          const x = batch[it.ref - 1];
+          if (!x) continue;
+          const merged = mergeResearch(x.input, it.result).input;
+          const r = scoreAccount(merged);
+          scored.push(toResult({
+            objectId: x.objectId,
+            name: merged.name ?? "(no name)",
+            domain: merged.domain ?? x.domain,
+            tier: r.tier,
+            score: r.score,
+            signals: r.signals,
+            researchNote: merged.researchNote,
+            researched: true
+          }));
+          await storage2.update("dossier", (cur) => ({ ...cur ?? {}, [x.domain]: { domain: x.domain, researchedAt: Date.now(), result: it.result } }));
+        }
+      }
+      const keys = batch.map((x) => sweepKey({ objectId: x.objectId, domain: x.domain }));
+      state = recordResults(state, scored, "WARM", keys);
+      await storage2.set("sweepState", state);
+    }
+    if (selectUnprocessed(researchable, new Set(state.processed), 1).length === 0) {
+      const prev = await firstRowId(tab.id);
+      const advanced = await clickNextPage(tab.id, prev);
+      if (advanced) {
+        state = { ...state, page: state.page + 1 };
+        await storage2.set("sweepState", state);
+      } else {
+        state = { ...state, active: false, done: true };
+        await storage2.set("sweepState", state);
+        await chrome.alarms.clear(ALARM);
+      }
+    }
   }
 
   // src/shared/queue.ts
@@ -1984,7 +2349,9 @@
   chrome.runtime.onInstalled.addListener(() => void startup());
   chrome.runtime.onStartup.addListener(() => void startup());
   chrome.alarms.onAlarm.addListener((alarm) => {
-    if (alarm.name === "deadman") {
+    if (alarm.name === "sweepTick") {
+      void sweepTick(bridge, storage);
+    } else if (alarm.name === "deadman") {
       void freeze.checkDeadMan();
     } else if (alarm.name === "heartbeat") {
       void (async () => {
@@ -2011,6 +2378,18 @@
     }
     if (msg?.type === "SOURCE_PREVIEW") {
       void previewSourcing(storage).then(sendResponse).catch((e) => sendResponse({ onHubspot: false, error: String(e?.message ?? e) }));
+      return true;
+    }
+    if (msg?.type === "START_SWEEP") {
+      void startSweep(storage).then(sendResponse).catch((e) => sendResponse({ error: String(e?.message ?? e) }));
+      return true;
+    }
+    if (msg?.type === "STOP_SWEEP") {
+      void stopSweep(storage).then((s) => sendResponse(s ?? { active: false })).catch((e) => sendResponse({ error: String(e?.message ?? e) }));
+      return true;
+    }
+    if (msg?.type === "SWEEP_STATUS") {
+      void getSweep(storage).then((s) => sendResponse(s ?? { active: false, note: "no sweep yet" })).catch((e) => sendResponse({ error: String(e?.message ?? e) }));
       return true;
     }
     if (msg?.type === "RESEARCH_THIN") {

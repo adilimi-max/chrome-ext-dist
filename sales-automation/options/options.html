@@ -18,7 +18,7 @@
     </style>
   </head>
   <body>
-    <h1>AE Automation</h1>
+    <h1>AE Automation <span id="ver" style="float:right;font-size:10px;letter-spacing:.05em;color:var(--dim);text-transform:none"></span></h1>
     <div class="row">
       <label for="mode">Deployment mode</label>
       <select id="mode">
@@ -33,6 +33,14 @@
     </div>
     <button id="save">Save</button>
     <div id="status"></div>
+
+    <h1 style="margin-top:36px">Autonomous sweep</h1>
+    <div class="row" style="flex-direction:row; flex-wrap:wrap; gap:10px">
+      <button id="sweepstart">Sweep all accounts</button>
+      <button id="sweepstatus">Sweep status / results</button>
+      <button id="sweepstop">Stop sweep</button>
+    </div>
+    <div class="note" style="margin-top:8px;border:0;padding:0">Open your HubSpot open-pool list + a logged-in claude.ai tab (web search ON), hit Sweep, walk away. It scrolls every page, batch-researches thin accounts, and collects WARM+ fits here. Read-only — never claims or writes. Resumes after a restart; click "Sweep status" to watch.</div>
 
     <h1 style="margin-top:36px">Diagnostics</h1>
     <div class="row" style="flex-direction:row; flex-wrap:wrap; gap:10px">

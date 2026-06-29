@@ -115,6 +115,29 @@
     if (mode) mode.value = cfg.deploymentMode;
     const autosend = sel("autosend");
     if (autosend) autosend.textContent = cfg.allowAutoSend ? "ON" : "OFF (draft-only)";
+    const ver = sel("ver");
+    const m = chrome.runtime.getManifest();
+    if (ver) ver.textContent = m.version_name ?? `v${m.version}`;
+  }
+  function renderSweep(s) {
+    if (!s || s.error) {
+      diag(s?.error ? `error: ${s.error}` : "no response");
+      return;
+    }
+    if (s.active === void 0 && s.results === void 0) {
+      diag(s);
+      return;
+    }
+    const phase = s.done ? "DONE" : s.active ? "RUNNING" : "STOPPED";
+    const results = (s.results ?? []).slice().sort((a, b) => b.score - a.score);
+    const head = `Sweep ${phase} \u2014 page ${(s.page ?? 0) + 1} \xB7 considered ${s.consideredCount ?? 0} \xB7 researched ${s.researchedCount ?? 0} \xB7 good-fit (WARM+) ${results.length}`;
+    const lines = results.slice(0, 50).map((r, i) => `${String(i + 1).padStart(2)}. [${r.tier}] ${r.score}  ${r.name}${r.researched ? " *" : ""}
+      ${r.domain} \u2014 ${r.why}`);
+    diag(`${head}
+${"-".repeat(48)}
+${lines.join("\n") || "(no WARM+ fits yet \u2014 keep it running)"}
+
+* = enriched by web research`);
   }
   async function save() {
     const storage = makeStorage(chromeBackend());
@@ -159,6 +182,16 @@
     sel("sourcepreview")?.addEventListener("click", () => {
       diag("Scoring your live open pool\u2026 (open your open-pool list view in a tab first; OBSERVE \u2014 nothing is claimed)");
       void sendToWorker("SOURCE_PREVIEW").then((r) => diag(r ?? { error: "no response from worker" }));
+    });
+    sel("sweepstart")?.addEventListener("click", () => {
+      diag('Sweep starting\u2026 open your HubSpot open-pool list + a logged-in claude.ai tab (web search ON), then walk away. It checkpoints as it goes \u2014 click "Sweep status / results" anytime to watch progress + see good-fit accounts.');
+      void sendToWorker("START_SWEEP").then(() => sendToWorker("SWEEP_STATUS")).then(renderSweep);
+    });
+    sel("sweepstatus")?.addEventListener("click", () => {
+      void sendToWorker("SWEEP_STATUS").then(renderSweep);
+    });
+    sel("sweepstop")?.addEventListener("click", () => {
+      void sendToWorker("STOP_SWEEP").then(renderSweep);
     });
     sel("research")?.addEventListener("click", () => {
       diag("Researching thin accounts via Claude.ai (web search)\u2026 this can take a couple of minutes \u2014 each is a live lookup. Results cache as they finish, so re-running continues where it left off.");

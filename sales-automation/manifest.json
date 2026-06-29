@@ -12,10 +12,16 @@
     "default_title": "AE Automation"
   },
   "options_page": "options/options.html",
-  "permissions": ["storage", "alarms", "scripting", "tabs"],
+  "permissions": [
+    "storage",
+    "alarms",
+    "scripting",
+    "tabs"
+  ],
   "host_permissions": [
     "https://claude.ai/*",
     "https://*.hubspot.com/*",
     "https://mail.google.com/*"
-  ]
+  ],
+  "version_name": "build 2026-06-29 14:10Z"
 }
