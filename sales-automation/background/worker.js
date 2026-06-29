@@ -427,6 +427,164 @@
     return { ensureSlot, send, read, peek, retire };
   }
 
+  // src/shared/scrapers/hubspot-map.ts
+  var DEFAULT_PROPERTY_MAP = {
+    recordId: "Record ID",
+    ptScore: "HubSpot PT Score",
+    mhit: "MHIT Score",
+    mrIntent: "MR Account Intent Score (66 MR)",
+    threeMonthIntent: "3M Account Intent Score (66 3M)",
+    pageViews: "Page Views",
+    fundingDate: "Funding Date",
+    employees: "Employees in Index",
+    employeesAlt: "HS Employees",
+    hubs: [
+      { signal: "Sales Hub Intent Signal", date: "Sales Hub Intent Date" },
+      { signal: "Service Hub Intent Signal", date: "Service Hub Intent Date" },
+      { signal: "Marketing Hub Intent Signal", date: "Marketing Hub Intent Date" },
+      { signal: "CRM Intent Signal", date: "CRM Intent Date" }
+    ],
+    engagement: "Engagement",
+    jobChangeTitle: "U5 New Job Title",
+    country: "Country",
+    industry: "HS Primary Industry",
+    lifecycleStage: "Lifecycle Stage"
+  };
+
+  // src/background/hubspot-diag.ts
+  function expectedPairs(pm) {
+    const pairs = [
+      { field: "recordId", expected: pm.recordId },
+      { field: "ptScore", expected: pm.ptScore },
+      { field: "mhit", expected: pm.mhit },
+      { field: "mrIntent", expected: pm.mrIntent },
+      { field: "threeMonthIntent", expected: pm.threeMonthIntent },
+      { field: "pageViews", expected: pm.pageViews },
+      { field: "fundingDate", expected: pm.fundingDate },
+      { field: "employees", expected: pm.employees },
+      { field: "employeesAlt", expected: pm.employeesAlt },
+      { field: "engagement", expected: pm.engagement },
+      { field: "jobChangeTitle", expected: pm.jobChangeTitle },
+      { field: "country", expected: pm.country },
+      { field: "industry", expected: pm.industry },
+      { field: "lifecycleStage", expected: pm.lifecycleStage }
+    ];
+    pm.hubs.forEach((h, i) => {
+      pairs.push({ field: `hub${i}.signal`, expected: h.signal });
+      pairs.push({ field: `hub${i}.date`, expected: h.date });
+    });
+    return pairs;
+  }
+  async function findHubspotTab() {
+    const tabs = await chrome.tabs.query({ url: ["*://*.hubspot.com/*"] });
+    if (tabs.length === 0) return null;
+    return tabs.sort((a, b) => (b.lastAccessed ?? 0) - (a.lastAccessed ?? 0))[0];
+  }
+  async function scrapeHubspotDiag() {
+    const tab = await findHubspotTab();
+    if (!tab?.id) {
+      return {
+        tabUrl: "",
+        onHubspot: false,
+        looksLikeIndex: false,
+        tableStrategy: null,
+        headerStrategy: null,
+        rowSampled: 0,
+        columns: [],
+        mapMatches: [],
+        note: "No HubSpot tab found. Open your open-pool LIST VIEW (the index table of companies) in a tab, then click again."
+      };
+    }
+    const [res] = await chrome.scripting.executeScript({
+      target: { tabId: tab.id },
+      func: (expected) => {
+        const norm = (s) => s.toLowerCase().replace(/\s+/g, " ").trim();
+        const classify = (raw) => {
+          const s = raw.trim();
+          if (!s) return "empty";
+          if (/@[\w.-]+\.\w+/.test(s)) return "email";
+          if (/^[-+]?[\d.,\s%$€£]+$/.test(s)) return "num";
+          if (/\d{4}-\d{2}-\d{2}/.test(s) || /\b\d{1,2}[/.]\d{1,2}[/.]\d{2,4}\b/.test(s) || /\b(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\b/i.test(s)) return "date";
+          return "text";
+        };
+        const tableSels = ['[data-test-id="table"]', '[role="grid"]', '[role="table"]', "table"];
+        let table = null;
+        let tableStrategy = null;
+        for (const s of tableSels) {
+          const el = document.querySelector(s);
+          if (el) {
+            table = el;
+            tableStrategy = s;
+            break;
+          }
+        }
+        const root = table ?? document;
+        const headerSels = ['[data-test-id*="column-header"]', '[role="columnheader"]', "thead th", "th"];
+        let headerEls = [];
+        let headerStrategy = null;
+        for (const s of headerSels) {
+          const els = [...root.querySelectorAll(s)];
+          if (els.length > 0) {
+            headerEls = els;
+            headerStrategy = s;
+            break;
+          }
+        }
+        const headers = headerEls.map((h) => (h.textContent ?? "").replace(/\s+/g, " ").trim());
+        const rowSels = ["tbody tr", '[role="row"]', "tr"];
+        let rows = [];
+        for (const s of rowSels) {
+          const els = [...root.querySelectorAll(s)].filter((r2) => r2.querySelector('td,[role="cell"],[role="gridcell"]'));
+          if (els.length > 0) {
+            rows = els;
+            break;
+          }
+        }
+        const sample = rows.slice(0, 12);
+        const colCount = Math.max(headers.length, ...sample.map((r2) => r2.querySelectorAll('td,[role="cell"],[role="gridcell"]').length), 0);
+        const columns = [];
+        for (let c = 0; c < colCount; c++) {
+          const header = headers[c] ?? "";
+          if (!header) continue;
+          const counts = {};
+          let nonEmpty2 = 0;
+          for (const r2 of sample) {
+            const cells = r2.querySelectorAll('td,[role="cell"],[role="gridcell"]');
+            const cls = classify(cells[c]?.textContent ?? "");
+            counts[cls] = (counts[cls] ?? 0) + 1;
+            if (cls !== "empty") nonEmpty2++;
+          }
+          const dominant = Object.entries(counts).filter(([k]) => k !== "empty").sort((a, b) => b[1] - a[1])[0]?.[0] ?? "empty";
+          columns.push({ header, fill: sample.length ? +(nonEmpty2 / sample.length).toFixed(2) : 0, type: dominant });
+        }
+        const normHeaders = headers.map(norm).filter(Boolean);
+        const mapMatches = expected.map(({ field, expected: exp }) => {
+          const n = norm(exp);
+          const found = normHeaders.some((h) => h === n || h.includes(n) || n.includes(h));
+          return { field, expected: exp, found };
+        });
+        const looksLikeIndex = /\/(objects|contacts|companies|prospecting|index)\b/i.test(location.pathname) || rows.length >= 2;
+        return {
+          tabUrl: location.href.split("?")[0],
+          onHubspot: true,
+          looksLikeIndex,
+          tableStrategy,
+          headerStrategy,
+          rowSampled: sample.length,
+          columns,
+          mapMatches,
+          note: ""
+        };
+      },
+      args: [expectedPairs(DEFAULT_PROPERTY_MAP)]
+    });
+    const r = res?.result;
+    if (!r) return { tabUrl: tab.url ?? "", onHubspot: true, looksLikeIndex: false, tableStrategy: null, headerStrategy: null, rowSampled: 0, columns: [], mapMatches: [], note: "No result from the HubSpot page (script blocked or page still loading). Make sure the list view is fully loaded, then retry." };
+    const matched = r.mapMatches.filter((m) => m.found).length;
+    r.note = !r.tableStrategy ? "Found a HubSpot tab but no table \u2014 open the open-pool LIST VIEW (the company index table), let it load, then retry." : r.columns.length === 0 ? `Table found (${r.tableStrategy}) but no labeled columns resolved \u2014 share this report so I can adjust the header selector.` : `OK \u2014 ${r.columns.length} labeled columns, ${matched}/${r.mapMatches.length} expected properties matched. Share this report + tell me any column names I should map.`;
+    return r;
+  }
+
   // src/shared/queue.ts
   function decideOnFailure(retryClass, attemptsMade) {
     if (retryClass === "mutating") return "quarantine";
@@ -1091,6 +1249,10 @@
         const ok = await bridge.canary();
         return ok ? { ok: true } : { ok: false, diag: await probeClaudeTab() };
       })().then(sendResponse).catch((e) => sendResponse({ ok: false, error: String(e?.message ?? e) }));
+      return true;
+    }
+    if (msg?.type === "TEST_HUBSPOT") {
+      void scrapeHubspotDiag().then(sendResponse).catch((e) => sendResponse({ onHubspot: false, error: String(e?.message ?? e) }));
       return true;
     }
     if (msg?.type === "AUDIT_TAIL") {

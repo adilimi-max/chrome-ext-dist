@@ -152,6 +152,10 @@
       diag("Testing claude.ai bridge\u2026 (opens a background tab; give it ~5s)");
       void sendToWorker("TEST_BRIDGE").then((r) => diag(r ?? { error: "no response from worker" }));
     });
+    sel("hubspot")?.addEventListener("click", () => {
+      diag("Reading your HubSpot list view\u2026 (open your open-pool index table in a tab first)");
+      void sendToWorker("TEST_HUBSPOT").then((r) => diag(r ?? { error: "no response from worker" }));
+    });
     sel("audit")?.addEventListener("click", () => {
       void sendToWorker("AUDIT_TAIL").then((r) => diag(r?.rows ?? []));
     });
