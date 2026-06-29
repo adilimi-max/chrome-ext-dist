@@ -133,7 +133,9 @@
     mrrK: DEFAULT_MRR_K,
     // CALIBRATION KNOB — tune ONCE against the OBSERVE MRR distribution (~ pool median)
     allowedTerritories: ["EMEA/Mid Market/Nordics"],
-    openOwnerValue: "Open Account (Salesforce)"
+    openOwnerValue: "Open Account (Salesforce)",
+    enforceViewFilters: false
+    // trust the HubSpot view's Nordic+open filter; don't re-cap from scraped text
   };
   function tierOf(score) {
     if (score >= 75) return "HOT";
@@ -179,8 +181,10 @@
       // A lone weak dimension (coverage below the floor — e.g. only industryFit/sizeFit present) is too
       // thin to justify more than NURTURE, even though re-normalization inflates its score.
       thinEvidence: coverage > 0 && coverage < COVERAGE_FLOOR,
-      territoryMismatch: terr !== "" && !allowed.has(terr),
-      ownedByRep: owner !== "" && owner.trim().toLowerCase() !== cfg.openOwnerValue.trim().toLowerCase()
+      // Gated on enforceViewFilters (DEFAULT OFF): the view already filters Nordic+open, and re-deriving
+      // these from scraped DOM text is unreliable. Off => never cap on territory/owner (trust the view).
+      territoryMismatch: cfg.enforceViewFilters && terr !== "" && !allowed.has(terr),
+      ownedByRep: cfg.enforceViewFilters && owner !== "" && owner.trim().toLowerCase() !== cfg.openOwnerValue.trim().toLowerCase()
     };
   }
   function buildSignals(input, norms) {

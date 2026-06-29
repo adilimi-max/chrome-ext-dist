@@ -594,6 +594,7 @@
         rowSampled: 0,
         columns: [],
         mapMatches: [],
+        samples: [],
         note: "No HubSpot tab found. Open your open-pool LIST VIEW (the index table of companies) in a tab, then click again."
       };
     }
@@ -659,6 +660,27 @@
           const dominant = Object.entries(counts).filter(([k]) => k !== "empty").sort((a, b) => b[1] - a[1])[0]?.[0] ?? "empty";
           columns.push({ header, fill: sample.length ? +(nonEmpty2 / sample.length).toFixed(2) : 0, type: dominant });
         }
+        const REDACT = /* @__PURE__ */ new Set([
+          "Company Description (Source of Truth)",
+          "Compelling Reasons to Reach Out - Details",
+          "Compelling Reasons to Reach Out - Summary",
+          "Company Domain Name"
+        ]);
+        const maskVal = (header, raw) => {
+          const v = (raw ?? "").replace(/\s+/g, " ").trim();
+          if (REDACT.has(header)) return v ? `[redacted ${v.length}ch]` : "";
+          if (/@[\w.-]+\.\w+/.test(v)) return "[email]";
+          if (/\+?\d[\d ()-]{7,}\d/.test(v)) return "[phone]";
+          return v.length > 48 ? `${v.slice(0, 48)}\u2026` : v;
+        };
+        const samples = sample.slice(0, 3).map((r2) => {
+          const cells = r2.querySelectorAll('td, [role="cell"], [role="gridcell"]');
+          const o = {};
+          headers.forEach((h, i) => {
+            if (h) o[h] = maskVal(h, cells[i]?.textContent ?? "");
+          });
+          return o;
+        });
         const normHeaders = headers.map(norm).filter(Boolean);
         const mapMatches = expected.map(({ field, expected: exp }) => {
           const n = norm(exp);
@@ -675,13 +697,14 @@
           rowSampled: sample.length,
           columns,
           mapMatches,
+          samples,
           note: ""
         };
       },
       args: [expectedPairs(DEFAULT_PROPERTY_MAP)]
     });
     const r = res?.result;
-    if (!r) return { tabUrl: tab.url ?? "", onHubspot: true, looksLikeIndex: false, tableStrategy: null, headerStrategy: null, rowSampled: 0, columns: [], mapMatches: [], note: "No result from the HubSpot page (script blocked or page still loading). Make sure the list view is fully loaded, then retry." };
+    if (!r) return { tabUrl: tab.url ?? "", onHubspot: true, looksLikeIndex: false, tableStrategy: null, headerStrategy: null, rowSampled: 0, columns: [], mapMatches: [], samples: [], note: "No result from the HubSpot page (script blocked or page still loading). Make sure the list view is fully loaded, then retry." };
     const matched = r.mapMatches.filter((m) => m.found).length;
     r.note = !r.tableStrategy ? "Found a HubSpot tab but no table \u2014 open the open-pool LIST VIEW (the company index table), let it load, then retry." : r.columns.length === 0 ? `Table found (${r.tableStrategy}) but no labeled columns resolved \u2014 share this report so I can adjust the header selector.` : `OK \u2014 ${r.columns.length} labeled columns, ${matched}/${r.mapMatches.length} expected properties matched. Share this report + tell me any column names I should map.`;
     return r;
@@ -762,7 +785,9 @@
     mrrK: DEFAULT_MRR_K,
     // CALIBRATION KNOB — tune ONCE against the OBSERVE MRR distribution (~ pool median)
     allowedTerritories: ["EMEA/Mid Market/Nordics"],
-    openOwnerValue: "Open Account (Salesforce)"
+    openOwnerValue: "Open Account (Salesforce)",
+    enforceViewFilters: false
+    // trust the HubSpot view's Nordic+open filter; don't re-cap from scraped text
   };
   function tierOf(score) {
     if (score >= 75) return "HOT";
@@ -808,8 +833,10 @@
       // A lone weak dimension (coverage below the floor — e.g. only industryFit/sizeFit present) is too
       // thin to justify more than NURTURE, even though re-normalization inflates its score.
       thinEvidence: coverage > 0 && coverage < COVERAGE_FLOOR,
-      territoryMismatch: terr !== "" && !allowed.has(terr),
-      ownedByRep: owner !== "" && owner.trim().toLowerCase() !== cfg.openOwnerValue.trim().toLowerCase()
+      // Gated on enforceViewFilters (DEFAULT OFF): the view already filters Nordic+open, and re-deriving
+      // these from scraped DOM text is unreliable. Off => never cap on territory/owner (trust the view).
+      territoryMismatch: cfg.enforceViewFilters && terr !== "" && !allowed.has(terr),
+      ownedByRep: cfg.enforceViewFilters && owner !== "" && owner.trim().toLowerCase() !== cfg.openOwnerValue.trim().toLowerCase()
     };
   }
   function buildSignals(input, norms) {
