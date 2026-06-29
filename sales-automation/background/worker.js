@@ -166,8 +166,42 @@
       }
     }
   }
+  var RESEARCH_DOMAIN = /^(?=.{1,253}$)[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+$/i;
+  var NAME_MAX_LEN = 80;
+  var NAME_PHONE = /(?:\d[\s().-]*){7,}/;
+  var NAME_CONTROL = /[\x00-\x1f\x7f]/;
+  function assertResearchEgressSafe(payload) {
+    if (payload === null || typeof payload !== "object" || Array.isArray(payload)) {
+      throw new EgressViolationError("research payload must be a {name, domain} object");
+    }
+    const keys = Object.keys(payload).sort();
+    if (keys.length !== 2 || keys[0] !== "domain" || keys[1] !== "name") {
+      throw new EgressViolationError(`research payload keys must be exactly {name, domain}, got {${keys.join(", ")}}`);
+    }
+    const { name, domain } = payload;
+    if (typeof name !== "string") throw new EgressViolationError("research name must be a string");
+    const n = name.replace(ZERO_WIDTH, "").trim();
+    if (n.length === 0) throw new EgressViolationError("research name is empty");
+    if (n.length > NAME_MAX_LEN) throw new EgressViolationError("research name too long (looks like a body)");
+    if (NAME_CONTROL.test(n)) throw new EgressViolationError("research name contains control chars/newlines");
+    if (EMAIL.test(n)) throw new EgressViolationError("research name is an email address");
+    if (NAME_PHONE.test(n)) throw new EgressViolationError("research name contains a phone number");
+    if (URL.test(n)) throw new EgressViolationError("research name is a URL");
+    if (DOMAIN.test(n)) throw new EgressViolationError("research name contains a domain");
+    if (wordCount(n) > 8) throw new EgressViolationError("research name is free text, not a company name");
+    if (typeof domain !== "string") throw new EgressViolationError("research domain must be a string");
+    const d = domain.replace(ZERO_WIDTH, "").trim();
+    if (d.includes("@")) throw new EgressViolationError("research domain is an email address");
+    if (!RESEARCH_DOMAIN.test(d)) throw new EgressViolationError("research domain is not a single bare domain token");
+  }
 
   // src/shared/bridge.ts
+  var SchemaError = class extends Error {
+    constructor(msg = "schema") {
+      super(msg);
+      this.name = "SchemaError";
+    }
+  };
   var PlausibilityError = class extends Error {
     constructor(msg = "plausibility") {
       super(msg);
@@ -196,7 +230,8 @@
     async function attempt(c, nonce, slotId) {
       if (c.egressPayload !== void 0) {
         try {
-          assertEgressSafe(c.egressPayload, c.egressTokens);
+          if (c.egressMode === "research") assertResearchEgressSafe(c.egressPayload);
+          else assertEgressSafe(c.egressPayload, c.egressTokens);
         } catch {
           return { ok: false, failure: "egress", nonce };
         }
@@ -735,6 +770,7 @@
     if (score >= 30) return "NURTURE";
     return "SKIP";
   }
+  var RESEARCHED_FIT_HAIRCUT = 0.85;
   var COVERAGE_FLOOR = 0.3;
   var round = (n, dp = 1) => {
     const f = 10 ** dp;
@@ -791,8 +827,11 @@
   function scoreAccount(input, cfg = DEFAULT_SCORING_CONFIG) {
     const revenue = input.annualRevenue;
     const whyNow = whyNowNorm(input.newHire, input.reasonsText);
+    const fitResearched = (input.researchedFields ?? []).includes("fitScore");
+    const fitRaw = fitNorm(input.fitScore);
+    const fitSignal = fitRaw != null && fitResearched ? fitRaw * RESEARCHED_FIT_HAIRCUT : fitRaw;
     const rawNorms = {
-      fitSignal: fitNorm(input.fitScore),
+      fitSignal,
       valueSignal: valueNorm(input.predictedMrr, cfg.mrrK),
       sizeFit: sizeFitNorm(input.employeeCount, revenue),
       industryFit: industryFitNorm(input.industry, input.industryAlt),
@@ -846,8 +885,179 @@
       confidence: flags.lowConfidence ? "LOW" : coverage >= 0.6 ? "HIGH" : coverage >= 0.35 ? "MEDIUM" : "LOW",
       flags,
       signals: buildSignals(input, rawNorms),
-      inputs
+      inputs,
+      researchedFields: input.researchedFields ?? []
     };
+  }
+
+  // src/prompts/types.ts
+  function tagAll(inner, name) {
+    const out = [];
+    for (const m of inner.matchAll(new RegExp(`<${name}>([\\s\\S]*?)</${name}>`, "g"))) out.push(m[1].trim());
+    return out;
+  }
+  function tagLast(inner, name) {
+    const all = tagAll(inner, name);
+    return all.length > 0 ? all[all.length - 1] : null;
+  }
+
+  // src/prompts/research-company.ts
+  var NOTE_MAX = 160;
+  var NAME_TRUNC = 80;
+  var INDUSTRY_LABEL = /^[a-z0-9 ,&/-]{1,40}$/i;
+  var truthy = (s) => s != null && /^true$/i.test(s.trim());
+  function egressClears(s) {
+    try {
+      assertEgressSafe(s);
+      return true;
+    } catch (e) {
+      if (e instanceof EgressViolationError) return false;
+      throw e;
+    }
+  }
+  function parseFit(raw) {
+    if (raw == null || raw.trim() === "") return null;
+    const n = Number(raw.trim());
+    if (!Number.isFinite(n)) return null;
+    if (n < 0 || n > 100) throw new PlausibilityError(`fit ${n} grossly out of range`);
+    const r = Math.round(n);
+    if (r < 1 || r > 10) {
+      if (r === 0) return 1;
+      if (r <= 12) return 10;
+      throw new PlausibilityError(`fit ${r} out of 1-10`);
+    }
+    return r;
+  }
+  function parseEmployees(raw) {
+    if (raw == null || raw.trim() === "") return null;
+    const n = Number(raw.replace(/[, ]/g, "").trim());
+    if (!Number.isFinite(n)) return null;
+    if (n < 0) throw new PlausibilityError(`employees ${n} negative`);
+    if (n > 5e6) throw new PlausibilityError(`employees ${n} implausibly large`);
+    return Math.round(n);
+  }
+  var PLACEHOLDER = /^[.…\s]*$/;
+  var isPlaceholder = (s) => s == null || PLACEHOLDER.test(s);
+  function parseResearch(inner) {
+    if (!/<response[\s>]/.test(inner) && !/<industry>|<sourced>|<fit>/.test(inner)) {
+      throw new SchemaError("missing research envelope");
+    }
+    const industryRaw = tagLast(inner, "industry");
+    const industry = industryRaw && !isPlaceholder(industryRaw) ? industryRaw.slice(0, NAME_TRUNC) : null;
+    const employees = parseEmployees(tagLast(inner, "employees"));
+    const fit = parseFit(tagLast(inner, "fit"));
+    const noteRaw = tagLast(inner, "note") ?? "";
+    const note = noteRaw.length > NOTE_MAX ? noteRaw.slice(0, NOTE_MAX) : noteRaw;
+    return {
+      industry,
+      employees,
+      fit,
+      funding: truthy(tagLast(inner, "funding")),
+      hiring: truthy(tagLast(inner, "hiring")),
+      expansion: truthy(tagLast(inner, "expansion")),
+      note,
+      sourced: truthy(tagLast(inner, "sourced"))
+    };
+  }
+  function makeResearchCall(payload) {
+    const { name, domain, hints } = payload;
+    const hintLines = [];
+    if (hints?.employees != null && Number.isFinite(hints.employees)) {
+      hintLines.push(`Known employee count (verify, do not blindly trust): ${Math.round(hints.employees)}`);
+    }
+    if (hints?.industry != null && hints.industry.trim() !== "") {
+      const label = hints.industry.trim();
+      if (INDUSTRY_LABEL.test(label) && egressClears(label)) {
+        hintLines.push(`Suspected industry label (verify): ${label}`);
+      }
+    }
+    return {
+      chatType: "analysis",
+      retryClass: "read",
+      promptName: "research-company",
+      egressMode: "research",
+      egressPayload: { name, domain },
+      // NOTHING else leaves the box — gated by assertResearchEgressSafe
+      render: (nonce) => [
+        "You are a B2B company researcher. Use WEB SEARCH to research the company below, then reply.",
+        `Company name: ${name}`,
+        `Company domain: ${domain}`,
+        ...hintLines,
+        "",
+        "Assess fit for a mid-market CRM / marketing / sales platform (HubSpot-style ideal customer).",
+        "Rules:",
+        "- USE WEB SEARCH. Do not guess from the name alone.",
+        "- If you cannot find reliable information, set <sourced>false</sourced> and leave unknown",
+        "  fields BLANK (empty tag) rather than guessing. An honest blank beats a fabricated number.",
+        "- <fit> is an integer 1-10 (10 = ideal mid-market CRM/marketing/sales customer).",
+        "- <employees> is your best INTEGER headcount estimate.",
+        "- <industry> is a short industry label.",
+        "- <funding>, <hiring>, <expansion> are true/false (recent funding round / actively hiring /",
+        '  geographic or product expansion) \u2014 useful "why now" signals.',
+        `- <note> is a SHORT why-now note, \u2264${NOTE_MAX} characters, no names of individuals.`,
+        "",
+        "Reply with EXACTLY this envelope and nothing else:",
+        `\xA7\xA7BEGIN ${nonce}\xA7\xA7`,
+        "<response><industry>\u2026</industry><employees>\u2026</employees><fit>\u2026</fit><funding>true|false</funding><hiring>true|false</hiring><expansion>true|false</expansion><note>\u2026</note><sourced>true|false</sourced></response>",
+        `\xA7\xA7END ${nonce}\xA7\xA7`
+      ].join("\n"),
+      parse: parseResearch
+    };
+  }
+
+  // src/shared/enrich.ts
+  function needsResearch(input) {
+    const industryMissing = (input.industry == null || input.industry.trim() === "") && (input.industryAlt == null || input.industryAlt.trim() === "");
+    return input.fitScore == null || industryMissing || input.employeeCount == null;
+  }
+  var NOTE_MAX2 = 160;
+  function whyNowText(r) {
+    const flags = [];
+    if (r.funding) flags.push("recent funding");
+    if (r.hiring) flags.push("actively hiring");
+    if (r.expansion) flags.push("expanding");
+    const note = (r.note ?? "").trim();
+    const parts = [flags.join(", "), note].filter((s) => s.length > 0);
+    if (parts.length === 0) return null;
+    const joined = parts.join(" \u2014 ");
+    return joined.length > NOTE_MAX2 ? joined.slice(0, NOTE_MAX2) : joined;
+  }
+  function mergeResearch(input, r) {
+    const out = { ...input };
+    const researched = [];
+    if (out.fitScore == null && r.fit != null && r.sourced) {
+      out.fitScore = r.fit;
+      researched.push("fitScore");
+    }
+    const industryMissing = (out.industry == null || out.industry.trim() === "") && (out.industryAlt == null || out.industryAlt.trim() === "");
+    if (industryMissing && r.industry != null && r.industry.trim() !== "") {
+      out.industry = r.industry.trim();
+      researched.push("industry");
+    }
+    if (out.employeeCount == null && r.employees != null && r.employees >= 0) {
+      out.employeeCount = r.employees;
+      researched.push("employeeCount");
+    }
+    if (r.sourced && r.hiring && out.newHire !== true) {
+      out.newHire = true;
+      researched.push("newHire");
+    }
+    const why = whyNowText(r);
+    if (r.sourced && (out.reasonsText == null || out.reasonsText.trim() === "") && why) {
+      out.reasonsText = why;
+      researched.push("reasonsText");
+    }
+    if (why && (out.reasonsText == null || out.reasonsText.trim() === "")) {
+      out.researchNote = why;
+    }
+    out.researchedFields = researched.length > 0 ? [...researched] : void 0;
+    return { input: out, researched };
+  }
+  var DAY_MS = 24 * 60 * 60 * 1e3;
+  function isFresh(entry, now, maxAgeDays = 45) {
+    if (!entry || typeof entry.researchedAt !== "number" || !Number.isFinite(entry.researchedAt)) return false;
+    const age = now - entry.researchedAt;
+    return age >= 0 && age < maxAgeDays * DAY_MS;
   }
 
   // src/background/hubspot-scrape.ts
@@ -886,32 +1096,55 @@
     });
     return res?.result ?? [];
   }
-  async function previewSourcing(topN = 15) {
+  var domainKey = (d) => (d ?? "").trim().toLowerCase();
+  async function previewSourcing(storage2, topN = 15) {
     const tab = await findHubspotTab2();
     if (!tab?.id) {
       return {
         onHubspot: false,
         scanned: 0,
         tierCounts: {},
+        thinUnresearched: 0,
+        enrichedFromCache: 0,
         top: [],
         note: "No HubSpot tab found. Open your open-pool list view in a tab, then click again."
       };
     }
     const rows = await scrapeRows(tab.id);
+    const dossier = await storage2.getOr("dossier", {});
+    const now = Date.now();
     const tierCounts = { HOT: 0, WARM: 0, NURTURE: 0, SKIP: 0 };
+    let thinUnresearched = 0;
+    let enrichedFromCache = 0;
     const scored = rows.map(({ objectId, row }) => {
-      const { input } = mapAccount(row, objectId);
+      let { input } = mapAccount(row, objectId);
+      let researched;
+      const thin = needsResearch(input);
+      if (thin) {
+        const entry = dossier[domainKey(input.domain)];
+        if (isFresh(entry, now)) {
+          const merged = mergeResearch(input, entry.result);
+          input = merged.input;
+          researched = merged.researched.length ? merged.researched : void 0;
+          enrichedFromCache += 1;
+        } else {
+          thinUnresearched += 1;
+        }
+      }
       const r = scoreAccount(input);
       tierCounts[r.tier] = (tierCounts[r.tier] ?? 0) + 1;
-      const why = r.signals.join(" \xB7 ") || "no scored signals on this row";
+      const signals = [...r.signals];
+      if (input.researchNote) signals.push(`why-now: ${input.researchNote}`);
       return {
         objectId,
         name: input.name ?? "(no name)",
         tier: r.tier,
         score: r.score,
         confidence: r.confidence,
-        why,
-        caps: r.caps
+        why: signals.join(" \xB7 ") || "no scored signals on this row",
+        caps: r.caps,
+        researched,
+        thin: thin && !researched
       };
     });
     scored.sort((a, b) => b.score - a.score);
@@ -920,8 +1153,70 @@
       onHubspot: true,
       scanned: rows.length,
       tierCounts,
+      thinUnresearched,
+      enrichedFromCache,
       top,
-      note: rows.length === 0 ? "On HubSpot but scraped 0 rows \u2014 open the open-pool LIST VIEW and let it load, then retry." : `OBSERVE preview of ${rows.length} loaded rows \u2014 nothing was claimed or staged. (Scroll the list to load more rows, then re-run, to see the whole pool.)`
+      note: rows.length === 0 ? "On HubSpot but scraped 0 rows \u2014 open the open-pool LIST VIEW and let it load, then retry." : `${rows.length} rows scored (${enrichedFromCache} enriched from cached research). ${thinUnresearched} thin account(s) still missing fit data \u2014 click "Research thin accounts" to fill them, then re-run this. OBSERVE: nothing claimed or staged. (Scroll the list to load more rows.)`
+    };
+  }
+  async function researchThinAccounts(bridge2, storage2, cap = 5) {
+    const tab = await findHubspotTab2();
+    if (!tab?.id) {
+      return {
+        onHubspot: false,
+        scanned: 0,
+        thin: 0,
+        researched: 0,
+        reused: 0,
+        failed: 0,
+        remaining: 0,
+        note: "No HubSpot tab found. Open your open-pool list view in a tab, then click again."
+      };
+    }
+    const rows = await scrapeRows(tab.id);
+    const dossier = await storage2.getOr("dossier", {});
+    const now = Date.now();
+    const queue2 = [];
+    let thin = 0;
+    let reused = 0;
+    const seen = /* @__PURE__ */ new Set();
+    for (const { objectId, row } of rows) {
+      const { input } = mapAccount(row, objectId);
+      if (!needsResearch(input)) continue;
+      thin += 1;
+      const domain = domainKey(input.domain);
+      if (!domain || seen.has(domain)) continue;
+      seen.add(domain);
+      if (isFresh(dossier[domain], now)) {
+        reused += 1;
+        continue;
+      }
+      if (!input.name) continue;
+      queue2.push({ name: input.name, domain, hints: { industry: input.industry ?? input.industryAlt, employees: input.employeeCount } });
+    }
+    const batch = queue2.slice(0, cap);
+    let researched = 0;
+    let failed = 0;
+    for (const t of batch) {
+      const res = await bridge2.call(makeResearchCall({ name: t.name, domain: t.domain, hints: t.hints }));
+      if (res.ok && res.value) {
+        const entry = { domain: t.domain, researchedAt: Date.now(), result: res.value };
+        await storage2.update("dossier", (cur) => ({ ...cur ?? {}, [t.domain]: entry }));
+        researched += 1;
+      } else {
+        failed += 1;
+      }
+    }
+    const remaining = queue2.length - batch.length;
+    return {
+      onHubspot: true,
+      scanned: rows.length,
+      thin,
+      researched,
+      reused,
+      failed,
+      remaining,
+      note: `Researched ${researched} thin account(s)${failed ? `, ${failed} failed (bridge timeout / no web result)` : ""}. ${reused} already cached. ${remaining} still queued \u2014 run again to continue. Then click "Preview sourcing" to see the re-ranked list.`
     };
   }
 
@@ -1596,7 +1891,11 @@
       return true;
     }
     if (msg?.type === "SOURCE_PREVIEW") {
-      void previewSourcing().then(sendResponse).catch((e) => sendResponse({ onHubspot: false, error: String(e?.message ?? e) }));
+      void previewSourcing(storage).then(sendResponse).catch((e) => sendResponse({ onHubspot: false, error: String(e?.message ?? e) }));
+      return true;
+    }
+    if (msg?.type === "RESEARCH_THIN") {
+      void researchThinAccounts(bridge, storage).then(sendResponse).catch((e) => sendResponse({ onHubspot: false, error: String(e?.message ?? e) }));
       return true;
     }
     if (msg?.type === "AUDIT_TAIL") {

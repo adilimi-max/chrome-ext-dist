@@ -160,6 +160,10 @@
       diag("Scoring your live open pool\u2026 (open your open-pool list view in a tab first; OBSERVE \u2014 nothing is claimed)");
       void sendToWorker("SOURCE_PREVIEW").then((r) => diag(r ?? { error: "no response from worker" }));
     });
+    sel("research")?.addEventListener("click", () => {
+      diag("Researching thin accounts via Claude.ai (web search)\u2026 this can take a couple of minutes \u2014 each is a live lookup. Results cache as they finish, so re-running continues where it left off.");
+      void sendToWorker("RESEARCH_THIN").then((r) => diag(r ?? { error: "no response (research may still be running \u2014 re-run Preview to see cached results)" }));
+    });
     sel("audit")?.addEventListener("click", () => {
       void sendToWorker("AUDIT_TAIL").then((r) => diag(r?.rows ?? []));
     });

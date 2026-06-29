@@ -141,6 +141,7 @@
     if (score >= 30) return "NURTURE";
     return "SKIP";
   }
+  var RESEARCHED_FIT_HAIRCUT = 0.85;
   var COVERAGE_FLOOR = 0.3;
   var round = (n, dp = 1) => {
     const f = 10 ** dp;
@@ -197,8 +198,11 @@
   function scoreAccount(input, cfg = DEFAULT_SCORING_CONFIG) {
     const revenue = input.annualRevenue;
     const whyNow = whyNowNorm(input.newHire, input.reasonsText);
+    const fitResearched = (input.researchedFields ?? []).includes("fitScore");
+    const fitRaw = fitNorm(input.fitScore);
+    const fitSignal = fitRaw != null && fitResearched ? fitRaw * RESEARCHED_FIT_HAIRCUT : fitRaw;
     const rawNorms = {
-      fitSignal: fitNorm(input.fitScore),
+      fitSignal,
       valueSignal: valueNorm(input.predictedMrr, cfg.mrrK),
       sizeFit: sizeFitNorm(input.employeeCount, revenue),
       industryFit: industryFitNorm(input.industry, input.industryAlt),
@@ -252,7 +256,8 @@
       confidence: flags.lowConfidence ? "LOW" : coverage >= 0.6 ? "HIGH" : coverage >= 0.35 ? "MEDIUM" : "LOW",
       flags,
       signals: buildSignals(input, rawNorms),
-      inputs
+      inputs,
+      researchedFields: input.researchedFields ?? []
     };
   }
 
