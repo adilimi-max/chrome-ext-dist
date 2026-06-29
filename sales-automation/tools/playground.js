@@ -95,13 +95,10 @@
     return Math.max(0, Math.min(1, v));
   }
   var INDUSTRY_HIGH = /(software|saas|information technology|it services|internet|tech(nology)?|professional services|marketing|advertis|e-?commerce|media|publishing|fintech|financial technology)/i;
-  var INDUSTRY_LOW = /(manufactur|heavy industry|industrial|construction|government|public sector|non-?profit|education|university|school|mining|agricultur|oil|gas|utilities)/i;
   function industryFitNorm(industry, industryAlt) {
     const s = industry && industry.trim() || industryAlt && industryAlt.trim() || "";
     if (!s) return null;
-    if (INDUSTRY_HIGH.test(s)) return 1;
-    if (INDUSTRY_LOW.test(s)) return 0.25;
-    return 0.5;
+    return 1;
   }
   var isHighFitIndustry = (industry, alt) => {
     const s = industry && industry.trim() || alt && alt.trim() || "";

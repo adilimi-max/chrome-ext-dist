@@ -764,13 +764,10 @@
     return Math.max(0, Math.min(1, v));
   }
   var INDUSTRY_HIGH = /(software|saas|information technology|it services|internet|tech(nology)?|professional services|marketing|advertis|e-?commerce|media|publishing|fintech|financial technology)/i;
-  var INDUSTRY_LOW = /(manufactur|heavy industry|industrial|construction|government|public sector|non-?profit|education|university|school|mining|agricultur|oil|gas|utilities)/i;
   function industryFitNorm(industry, industryAlt) {
     const s = industry && industry.trim() || industryAlt && industryAlt.trim() || "";
     if (!s) return null;
-    if (INDUSTRY_HIGH.test(s)) return 1;
-    if (INDUSTRY_LOW.test(s)) return 0.25;
-    return 0.5;
+    return 1;
   }
   var isHighFitIndustry = (industry, alt) => {
     const s = industry && industry.trim() || alt && alt.trim() || "";
@@ -1113,7 +1110,8 @@
   async function scrapeRows(tabId) {
     const [res] = await chrome.scripting.executeScript({
       target: { tabId },
-      func: () => {
+      func: async () => {
+        const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
         const tableSels = ['[data-test-id="table"]', '[role="grid"]', '[role="table"]', "table"];
         let table = document;
         for (const s of tableSels) {
@@ -1134,15 +1132,14 @@
         }
         const headers = headerEls.map((h) => (h.textContent ?? "").replace(/\s+/g, " ").trim());
         const headerCount = headers.length;
-        const rowSels = ["tbody tr", '[role="row"]', "tr"];
-        let rowEls = [];
-        for (const s of rowSels) {
-          const els = [...table.querySelectorAll(s)].filter((r) => r.querySelector('td, [role="cell"], [role="gridcell"]'));
-          if (els.length) {
-            rowEls = els;
-            break;
+        const CELL = 'td, [role="cell"], [role="gridcell"]';
+        const currentRows = () => {
+          for (const s of ["tbody tr", '[role="row"]', "tr"]) {
+            const els = [...table.querySelectorAll(s)].filter((r) => r.querySelector(CELL));
+            if (els.length) return els;
           }
-        }
+          return [];
+        };
         const idFrom = (r) => {
           for (const a of r.querySelectorAll("a[href]")) {
             const href = a.getAttribute("href") ?? "";
@@ -1152,7 +1149,7 @@
           return "";
         };
         const alignedCells = (r) => {
-          let cells = [...r.querySelectorAll('td, [role="cell"], [role="gridcell"]')];
+          let cells = [...r.querySelectorAll(CELL)];
           while (cells.length > 0) {
             const c0 = cells[0];
             if (c0.querySelector('input[type="checkbox"]') || /^select row$/i.test((c0.textContent ?? "").trim())) {
@@ -1168,14 +1165,46 @@
           const v = (s ?? "").replace(/\s+/g, " ").trim();
           return v === "--" || v === "\u2014" || v === "-" ? "" : v;
         };
-        return rowEls.map((r) => {
+        const buildRow = (r) => {
           const cells = alignedCells(r);
           const row = {};
           headers.forEach((h, i) => {
             if (h) row[h] = clean(cells[i]?.textContent ?? "");
           });
-          return { objectId: idFrom(r), row };
-        });
+          return row;
+        };
+        const findScroller = (start) => {
+          let n = start;
+          while (n && n !== document.body && n !== document.documentElement) {
+            const st = getComputedStyle(n);
+            if ((st.overflowY === "auto" || st.overflowY === "scroll") && n.scrollHeight > n.clientHeight + 40) return n;
+            n = n.parentElement;
+          }
+          return document.scrollingElement ?? document.documentElement;
+        };
+        const scroller = findScroller(table instanceof Element ? table : document.body);
+        const byKey = /* @__PURE__ */ new Map();
+        const harvest = () => {
+          for (const r of currentRows()) {
+            const objectId = idFrom(r);
+            const row = buildRow(r);
+            const key = objectId || JSON.stringify(row);
+            if (!byKey.has(key)) byKey.set(key, { objectId, row });
+          }
+        };
+        harvest();
+        let stable = 0;
+        for (let i = 0; i < 80 && stable < 3; i++) {
+          const before = byKey.size;
+          const prevTop = scroller.scrollTop;
+          scroller.scrollBy(0, Math.max(240, scroller.clientHeight * 0.85));
+          await sleep(420);
+          harvest();
+          const atBottom = scroller.scrollTop <= prevTop + 2;
+          if (byKey.size === before && atBottom) stable += 1;
+          else stable = 0;
+        }
+        return [...byKey.values()];
       }
     });
     return res?.result ?? [];
@@ -1243,7 +1272,7 @@
       note: rows.length === 0 ? "On HubSpot but scraped 0 rows \u2014 open the open-pool LIST VIEW and let it load, then retry." : `${rows.length} rows scored (${enrichedFromCache} enriched from cached research). ${thinUnresearched} thin account(s) still missing fit data \u2014 click "Research thin accounts" to fill them, then re-run this. OBSERVE: nothing claimed or staged. (Scroll the list to load more rows.)`
     };
   }
-  async function researchThinAccounts(bridge2, storage2, cap = 5) {
+  async function researchThinAccounts(bridge2, storage2, cap = 8) {
     const tab = await findHubspotTab2();
     if (!tab?.id) {
       return {
@@ -1276,8 +1305,14 @@
         continue;
       }
       if (!input.name) continue;
-      queue2.push({ name: input.name, domain, hints: { industry: input.industry ?? input.industryAlt, employees: input.employeeCount } });
+      queue2.push({
+        name: input.name,
+        domain,
+        hints: { industry: input.industry ?? input.industryAlt, employees: input.employeeCount },
+        score: scoreAccount(input).score
+      });
     }
+    queue2.sort((a, b) => b.score - a.score);
     const batch = queue2.slice(0, cap);
     let researched = 0;
     let failed = 0;
