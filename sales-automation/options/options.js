@@ -156,6 +156,10 @@
       diag("Reading your HubSpot list view\u2026 (open your open-pool index table in a tab first)");
       void sendToWorker("TEST_HUBSPOT").then((r) => diag(r ?? { error: "no response from worker" }));
     });
+    sel("sourcepreview")?.addEventListener("click", () => {
+      diag("Scoring your live open pool\u2026 (open your open-pool list view in a tab first; OBSERVE \u2014 nothing is claimed)");
+      void sendToWorker("SOURCE_PREVIEW").then((r) => diag(r ?? { error: "no response from worker" }));
+    });
     sel("audit")?.addEventListener("click", () => {
       void sendToWorker("AUDIT_TAIL").then((r) => diag(r?.rows ?? []));
     });

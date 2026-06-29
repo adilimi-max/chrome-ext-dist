@@ -427,6 +427,64 @@
     return { ensureSlot, send, read, peek, retire };
   }
 
+  // src/shared/scrape-util.ts
+  var canonicalizeNumeric = (raw) => {
+    const s = raw.replace(/\s/g, "");
+    const lastComma = s.lastIndexOf(",");
+    const lastDot = s.lastIndexOf(".");
+    if (lastComma === -1 && lastDot === -1) return s;
+    const decChar = lastComma > lastDot ? "," : ".";
+    const decPos = Math.max(lastComma, lastDot);
+    const trailing = s.length - decPos - 1;
+    const groupChar = decChar === "," ? "." : ",";
+    const hasGroup = s.indexOf(groupChar) !== -1;
+    const decimalSeparatorCount = (s.match(decChar === "," ? /,/g : /\./g) ?? []).length;
+    const isDecimal = trailing >= 1 && trailing <= 2 && (hasGroup || decimalSeparatorCount === 1) && !(trailing === 3);
+    let out;
+    if (isDecimal) {
+      out = s.split(groupChar).join("").replace(decChar, "#").replace(/[,.]/g, "").replace("#", ".");
+    } else {
+      out = s.replace(/[,.]/g, "");
+    }
+    return out;
+  };
+  var num = (s) => {
+    if (s == null) return null;
+    if (typeof s === "number") return Number.isFinite(s) ? s : null;
+    const kept = s.replace(/[^0-9.,+-]/g, "");
+    const sign = /^-/.test(s.trim()) ? "-" : "";
+    const t = sign + canonicalizeNumeric(kept.replace(/[+-]/g, ""));
+    if (t === "" || t === "-" || t === "+" || t === ".") return null;
+    const n = Number(t);
+    return Number.isFinite(n) ? n : null;
+  };
+  var MAG = { k: 1e3, m: 1e6, b: 1e9, t: 1e12 };
+  var parseMoneyToken = (raw) => {
+    const t = raw.trim().toLowerCase().replace(/[$€£¥\s]/g, "").replace(/usd|eur|gbp|sek|nok|dkk/g, "");
+    const mm = t.match(/(-?\d[\d.,]*)\s*([kmbt])?/);
+    if (!mm) return null;
+    const n = num(mm[1]);
+    if (n == null) return null;
+    return mm[2] ? n * MAG[mm[2]] : n;
+  };
+  var parseRevenue = (text) => {
+    if (text == null) return null;
+    const s = text.trim();
+    if (s === "" || /^(unknown|n\/?a|-|–|—|none|null)$/i.test(s)) return null;
+    const range = s.match(/^(.*?\d[kmbt]?)\s*(?:[-–—]|\bto\b)\s*(\d.*)$/i);
+    if (range) {
+      const hi = parseMoneyToken(range[2]);
+      let loRaw = range[1].trim();
+      if (hi != null && !/[kmbt]\s*$/i.test(loRaw)) {
+        const hiSuffix = range[2].trim().match(/([kmbt])\s*$/i);
+        if (hiSuffix) loRaw = loRaw + hiSuffix[1];
+      }
+      const lo = parseMoneyToken(loRaw);
+      if (lo != null && hi != null) return (lo + hi) / 2;
+    }
+    return parseMoneyToken(s);
+  };
+
   // src/shared/scrapers/hubspot-map.ts
   var DEFAULT_PROPERTY_MAP = {
     name: "Company name",
@@ -443,6 +501,28 @@
     territory: "Company Info Territory",
     owner: "Company owner"
   };
+  var joinReasons = (details, summary) => {
+    const parts = [summary, details].map((s) => (s ?? "").trim()).filter(Boolean);
+    return parts.length ? parts.join(" \u2014 ") : null;
+  };
+  function mapAccount(company, objectId = "", signals = {}, pm = DEFAULT_PROPERTY_MAP) {
+    const input = {
+      name: company[pm.name]?.trim() || null,
+      domain: company[pm.domain]?.trim() || null,
+      description: company[pm.description]?.trim() || null,
+      fitScore: num(company[pm.fitScore]),
+      predictedMrr: num(company[pm.predictedMrr]),
+      employeeCount: num(company[pm.employees]),
+      annualRevenue: parseRevenue(company[pm.annualRevenue]),
+      industry: company[pm.industry]?.trim() || null,
+      industryAlt: company[pm.industryAlt]?.trim() || null,
+      reasonsText: joinReasons(company[pm.reasonsDetails], company[pm.reasonsSummary]),
+      newHire: signals.newHire ?? null,
+      territory: company[pm.territory]?.trim() || null,
+      owner: company[pm.owner]?.trim() || null
+    };
+    return { objectId, input, sourcing: { company, contacts: [] } };
+  }
 
   // src/background/hubspot-diag.ts
   function expectedPairs(pm) {
@@ -570,6 +650,279 @@
     const matched = r.mapMatches.filter((m) => m.found).length;
     r.note = !r.tableStrategy ? "Found a HubSpot tab but no table \u2014 open the open-pool LIST VIEW (the company index table), let it load, then retry." : r.columns.length === 0 ? `Table found (${r.tableStrategy}) but no labeled columns resolved \u2014 share this report so I can adjust the header selector.` : `OK \u2014 ${r.columns.length} labeled columns, ${matched}/${r.mapMatches.length} expected properties matched. Share this report + tell me any column names I should map.`;
     return r;
+  }
+
+  // src/shared/scoring-signals.ts
+  function piecewise(x, pts) {
+    if (x <= pts[0][0]) return pts[0][1];
+    const last = pts[pts.length - 1];
+    if (x >= last[0]) return last[1];
+    for (let i = 1; i < pts.length; i++) {
+      if (x <= pts[i][0]) {
+        const [x0, y0] = pts[i - 1];
+        const [x1, y1] = pts[i];
+        return y0 + (x - x0) / (x1 - x0) * (y1 - y0);
+      }
+    }
+    return last[1];
+  }
+  function fitNorm(fitScore) {
+    if (fitScore == null || !Number.isFinite(fitScore)) return null;
+    const lin = Math.max(0, Math.min(1, (fitScore - 1) / 9));
+    return 0.6 * lin + 0.4 * lin * lin;
+  }
+  var DEFAULT_MRR_K = 1e3;
+  function valueNorm(mrr, k = DEFAULT_MRR_K) {
+    if (mrr == null || !Number.isFinite(mrr) || mrr < 0) return null;
+    const kk = k > 0 ? k : DEFAULT_MRR_K;
+    return mrr / (mrr + kk);
+  }
+  var SIZE_PTS = [[0, 0], [50, 1], [500, 1], [1e3, 0.4], [3e3, 0.1]];
+  function sizeFitNorm(employees, revenue) {
+    if (employees == null || !Number.isFinite(employees) || employees < 0) return null;
+    let v = piecewise(employees, SIZE_PTS);
+    if (revenue != null && Number.isFinite(revenue) && revenue > 0 && employees > 0) {
+      const perHead = revenue / employees;
+      if (perHead < 15e3) v -= 0.05;
+      else if (perHead > 2e6) v -= 0.05;
+    }
+    return Math.max(0, Math.min(1, v));
+  }
+  var INDUSTRY_HIGH = /(software|saas|information technology|it services|internet|tech(nology)?|professional services|marketing|advertis|e-?commerce|media|publishing|fintech|financial technology)/i;
+  var INDUSTRY_LOW = /(manufactur|heavy industry|industrial|construction|government|public sector|non-?profit|education|university|school|mining|agricultur|oil|gas|utilities)/i;
+  function industryFitNorm(industry, industryAlt) {
+    const s = industry && industry.trim() || industryAlt && industryAlt.trim() || "";
+    if (!s) return null;
+    if (INDUSTRY_HIGH.test(s)) return 1;
+    if (INDUSTRY_LOW.test(s)) return 0.25;
+    return 0.5;
+  }
+  var isHighFitIndustry = (industry, alt) => {
+    const s = industry && industry.trim() || alt && alt.trim() || "";
+    return !!s && INDUSTRY_HIGH.test(s);
+  };
+  var STRONG_INTENT_RE = /(\bfunding\b|\braised\b|\braise\b|\bseries\s?[a-e]\b|\bseed\b|\bhiring\b|\bhire\b|\bexpand\b|\bexpansion\b|\bnew\s+(vp|chief|head|director)\b|\bscaling\b|\bscale[\s-]?up\b|\bmigrat|\bgrowth\b|\blaunch\b)/i;
+  function whyNowNorm(newHire, reasonsText) {
+    if (newHire === true) return 1;
+    const t = (reasonsText ?? "").trim();
+    if (t && STRONG_INTENT_RE.test(t)) return 0.5;
+    return 0;
+  }
+
+  // src/shared/scoring.ts
+  var WEIGHTS = {
+    fitSignal: 35,
+    // HubSpot's native FIT model
+    valueSignal: 30,
+    // HubSpot's predicted-MRR VALUE model
+    sizeFit: 15,
+    // 50-500 mid-market band
+    industryFit: 10,
+    // HubSpot-shaped vertical
+    whyNow: 10
+    // optional trigger (additive — never lowers)
+  };
+  var WEIGHT_ORDER = ["fitSignal", "valueSignal", "sizeFit", "industryFit", "whyNow"];
+  var DEFAULT_SCORING_CONFIG = {
+    mrrK: DEFAULT_MRR_K,
+    // CALIBRATION KNOB — tune ONCE against the OBSERVE MRR distribution (~ pool median)
+    allowedTerritories: ["EMEA/Mid Market/Nordics"],
+    openOwnerValue: "Open Account (Salesforce)"
+  };
+  function tierOf(score) {
+    if (score >= 75) return "HOT";
+    if (score >= 50) return "WARM";
+    if (score >= 30) return "NURTURE";
+    return "SKIP";
+  }
+  var COVERAGE_FLOOR = 0.3;
+  var round = (n, dp = 1) => {
+    const f = 10 ** dp;
+    return Math.round(n * f) / f;
+  };
+  var RANK = { SKIP: 0, NURTURE: 1, WARM: 2, HOT: 3 };
+  var BY_RANK = ["SKIP", "NURTURE", "WARM", "HOT"];
+  var normTerritory = (s) => (s ?? "").trim().toLowerCase();
+  function applyTierCaps(tier, f) {
+    let cap = RANK.HOT;
+    const caps = [];
+    const apply = (max, label) => {
+      if (RANK[tier] > max) caps.push(label);
+      cap = Math.min(cap, max);
+    };
+    if (f.territoryMismatch) apply(RANK.SKIP, "outside Nordics territory");
+    if (f.ownedByRep) apply(RANK.SKIP, "already owned by a rep");
+    if (f.lowConfidence) apply(RANK.WARM, "no Fit/MRR evidence \u2014 low confidence");
+    if (f.lacksValueEvidence) apply(RANK.WARM, "no value (MRR) evidence \u2014 not a top call");
+    if (f.thinEvidence) apply(RANK.NURTURE, "thin evidence \u2014 single weak signal");
+    return { tier: BY_RANK[Math.min(RANK[tier], cap)], caps };
+  }
+  function computeFlags(input, cfg, hasWhyNow, valuePresent, coverage) {
+    const allowed = new Set(cfg.allowedTerritories.map(normTerritory));
+    const terr = normTerritory(input.territory);
+    const owner = (input.owner ?? "").trim();
+    return {
+      hasWhyNow,
+      // lowConfidence = NO Fit AND NO MRR evidence. A reported MRR of 0 IS evidence (low-value), so it
+      // does NOT count as missing here — only a null/absent MRR does. (negative = invalid data => absent.)
+      lowConfidence: input.fitScore == null && (input.predictedMrr == null || input.predictedMrr < 0),
+      // No VALUE evidence at all => cannot be HOT (a top call needs both fit AND value). valuePresent is
+      // the valueNorm result presence (a reported 0 IS present evidence; only null/absent counts as missing).
+      lacksValueEvidence: !valuePresent,
+      // A lone weak dimension (coverage below the floor — e.g. only industryFit/sizeFit present) is too
+      // thin to justify more than NURTURE, even though re-normalization inflates its score.
+      thinEvidence: coverage > 0 && coverage < COVERAGE_FLOOR,
+      territoryMismatch: terr !== "" && !allowed.has(terr),
+      ownedByRep: owner !== "" && owner.trim().toLowerCase() !== cfg.openOwnerValue.trim().toLowerCase()
+    };
+  }
+  function buildSignals(input, norms) {
+    const out = [];
+    if (input.fitScore != null) out.push(`HubSpot Fit Score ${input.fitScore}/10`);
+    if (input.predictedMrr != null && input.predictedMrr > 0) out.push(`Predicted MRR ${Math.round(input.predictedMrr)}`);
+    if (isHighFitIndustry(input.industry, input.industryAlt)) {
+      out.push(`HubSpot-shaped vertical (${input.industry || input.industryAlt})`);
+    }
+    if (input.employeeCount != null) out.push(`${input.employeeCount} employees`);
+    if (input.newHire === true) out.push("New GTM-leadership hire (LinkedIn signal)");
+    else if (norms.whyNow != null && norms.whyNow > 0) out.push("Compelling reason to reach out");
+    return out;
+  }
+  function scoreAccount(input, cfg = DEFAULT_SCORING_CONFIG) {
+    const revenue = input.annualRevenue;
+    const whyNow = whyNowNorm(input.newHire, input.reasonsText);
+    const rawNorms = {
+      fitSignal: fitNorm(input.fitScore),
+      valueSignal: valueNorm(input.predictedMrr, cfg.mrrK),
+      sizeFit: sizeFitNorm(input.employeeCount, revenue),
+      industryFit: industryFitNorm(input.industry, input.industryAlt),
+      // null when industry is unknown/blank
+      whyNow
+      // additive-only: 0 when absent (does not lower the score)
+    };
+    const evidenceKeys = ["fitSignal", "valueSignal", "sizeFit", "industryFit"];
+    let presentWeight = 0;
+    let weighted = 0;
+    for (const k of evidenceKeys) {
+      const v = rawNorms[k];
+      if (v != null) {
+        presentWeight += WEIGHTS[k];
+        weighted += v * WEIGHTS[k];
+      }
+    }
+    const evidenceBudget = 100 - WEIGHTS.whyNow;
+    const evidenceScore = presentWeight > 0 ? weighted / presentWeight * evidenceBudget : 0;
+    const whyNowScore = whyNow * WEIGHTS.whyNow;
+    const clamped = Math.max(0, Math.min(100, evidenceScore + whyNowScore));
+    let covWeight = presentWeight;
+    if (whyNow > 0) covWeight += WEIGHTS.whyNow;
+    const coverage = covWeight / 100;
+    const flags = computeFlags(input, cfg, whyNow > 0, rawNorms.valueSignal != null, coverage);
+    const baseTier = tierOf(clamped);
+    const { tier, caps } = applyTierCaps(baseTier, flags);
+    const inputs = WEIGHT_ORDER.map((k) => rawNorms[k] ?? 0);
+    const evScale = presentWeight > 0 ? evidenceBudget / presentWeight : 0;
+    const breakdown = {};
+    const nominalBreakdown = {};
+    for (const k of WEIGHT_ORDER) {
+      if (k === "whyNow") {
+        breakdown[k] = round(whyNowScore);
+        nominalBreakdown[k] = round(whyNowScore);
+      } else {
+        breakdown[k] = round((rawNorms[k] ?? 0) * WEIGHTS[k] * evScale);
+        nominalBreakdown[k] = round((rawNorms[k] ?? 0) * WEIGHTS[k]);
+      }
+    }
+    const breakdownRescaled = presentWeight > 0 && presentWeight < evidenceBudget;
+    return {
+      score: round(clamped),
+      tier,
+      baseTier,
+      caps,
+      breakdown,
+      nominalBreakdown,
+      breakdownRescaled,
+      coverage: round(coverage, 2),
+      confidence: flags.lowConfidence ? "LOW" : coverage >= 0.6 ? "HIGH" : coverage >= 0.35 ? "MEDIUM" : "LOW",
+      flags,
+      signals: buildSignals(input, rawNorms),
+      inputs
+    };
+  }
+
+  // src/background/hubspot-scrape.ts
+  async function findHubspotTab2() {
+    const tabs = await chrome.tabs.query({ url: ["*://*.hubspot.com/*"] });
+    if (tabs.length === 0) return null;
+    return tabs.sort((a, b) => (b.lastAccessed ?? 0) - (a.lastAccessed ?? 0))[0];
+  }
+  async function scrapeRows(tabId) {
+    const [res] = await chrome.scripting.executeScript({
+      target: { tabId },
+      func: () => {
+        const table = document.querySelector('[data-test-id="table"], [role="grid"], [role="table"], table') ?? document;
+        const headerEls = [...table.querySelectorAll('[data-test-id*="column-header"], [role="columnheader"], thead th, th')];
+        const headers = headerEls.map((h) => (h.textContent ?? "").replace(/\s+/g, " ").trim());
+        const rowEls = [...table.querySelectorAll('tbody tr, [role="row"]')].filter(
+          (r) => r.querySelector('td, [role="cell"], [role="gridcell"]')
+        );
+        const idFrom = (r) => {
+          for (const a of r.querySelectorAll("a[href]")) {
+            const href = a.getAttribute("href") ?? "";
+            const m = href.match(/record\/0-2\/(\d+)/) ?? href.match(/company\/(\d+)/) ?? href.match(/0-2\/(\d+)/);
+            if (m) return m[1];
+          }
+          return "";
+        };
+        return rowEls.map((r) => {
+          const cells = [...r.querySelectorAll('td, [role="cell"], [role="gridcell"]')];
+          const row = {};
+          headers.forEach((h, i) => {
+            if (h) row[h] = (cells[i]?.textContent ?? "").replace(/\s+/g, " ").trim();
+          });
+          return { objectId: idFrom(r), row };
+        });
+      }
+    });
+    return res?.result ?? [];
+  }
+  async function previewSourcing(topN = 15) {
+    const tab = await findHubspotTab2();
+    if (!tab?.id) {
+      return {
+        onHubspot: false,
+        scanned: 0,
+        tierCounts: {},
+        top: [],
+        note: "No HubSpot tab found. Open your open-pool list view in a tab, then click again."
+      };
+    }
+    const rows = await scrapeRows(tab.id);
+    const tierCounts = { HOT: 0, WARM: 0, NURTURE: 0, SKIP: 0 };
+    const scored = rows.map(({ objectId, row }) => {
+      const { input } = mapAccount(row, objectId);
+      const r = scoreAccount(input);
+      tierCounts[r.tier] = (tierCounts[r.tier] ?? 0) + 1;
+      const why = r.signals.join(" \xB7 ") || "no scored signals on this row";
+      return {
+        objectId,
+        name: input.name ?? "(no name)",
+        tier: r.tier,
+        score: r.score,
+        confidence: r.confidence,
+        why,
+        caps: r.caps
+      };
+    });
+    scored.sort((a, b) => b.score - a.score);
+    const top = scored.slice(0, topN).map((s, i) => ({ rank: i + 1, ...s }));
+    return {
+      onHubspot: true,
+      scanned: rows.length,
+      tierCounts,
+      top,
+      note: rows.length === 0 ? "On HubSpot but scraped 0 rows \u2014 open the open-pool LIST VIEW and let it load, then retry." : `OBSERVE preview of ${rows.length} loaded rows \u2014 nothing was claimed or staged. (Scroll the list to load more rows, then re-run, to see the whole pool.)`
+    };
   }
 
   // src/shared/queue.ts
@@ -1240,6 +1593,10 @@
     }
     if (msg?.type === "TEST_HUBSPOT") {
       void scrapeHubspotDiag().then(sendResponse).catch((e) => sendResponse({ onHubspot: false, error: String(e?.message ?? e) }));
+      return true;
+    }
+    if (msg?.type === "SOURCE_PREVIEW") {
+      void previewSourcing().then(sendResponse).catch((e) => sendResponse({ onHubspot: false, error: String(e?.message ?? e) }));
       return true;
     }
     if (msg?.type === "AUDIT_TAIL") {
