@@ -1656,6 +1656,8 @@
       await storage2.set("sweepState", state);
     }
     const researchable = mapped.filter((m) => worthResearching(m.input, m.result.tier)).map((m) => ({ objectId: m.objectId, domain: dk(m.input.domain), input: m.input }));
+    state = { ...state, researchableSeen: (state.researchableSeen ?? 0) + researchable.filter((x) => !state.processed.includes(sweepKey({ objectId: x.objectId, domain: x.domain }))).length };
+    await storage2.set("sweepState", state);
     for (let b = 0; b < BATCHES_PER_TICK; b++) {
       const batch = selectUnprocessed(researchable, new Set(state.processed), BATCH_SIZE);
       if (batch.length === 0) break;
@@ -1688,6 +1690,12 @@
       }
       const keys = batch.map((x) => sweepKey({ objectId: x.objectId, domain: x.domain }));
       state = recordResults(state, scored, "WARM", keys);
+      state = {
+        ...state,
+        batchesOk: (state.batchesOk ?? 0) + (res.ok ? 1 : 0),
+        batchesFailed: (state.batchesFailed ?? 0) + (res.ok ? 0 : 1),
+        lastFailure: res.ok ? state.lastFailure : res.failure ?? "unknown"
+      };
       await storage2.set("sweepState", state);
     }
     if (selectUnprocessed(researchable, new Set(state.processed), 1).length === 0) {
