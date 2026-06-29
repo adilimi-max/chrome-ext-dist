@@ -1,0 +1,21 @@
+{
+  "manifest_version": 3,
+  "name": "AE Workflow Automation",
+  "version": "0.1.0",
+  "description": "Prepares everything around calls and meetings; stages actions for review, never auto-sends.",
+  "background": {
+    "service_worker": "background/worker.js",
+    "type": "module"
+  },
+  "action": {
+    "default_popup": "popup/popup.html",
+    "default_title": "AE Automation"
+  },
+  "options_page": "options/options.html",
+  "permissions": ["storage", "alarms", "scripting", "tabs"],
+  "host_permissions": [
+    "https://claude.ai/*",
+    "https://*.hubspot.com/*",
+    "https://mail.google.com/*"
+  ]
+}

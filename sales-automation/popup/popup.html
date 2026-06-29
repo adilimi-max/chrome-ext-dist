@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>AE Automation</title>
+    <style>
+      :root { --bg:#0e0f12; --fg:#d7dade; --dim:#6b7178; --accent:#e8a33d; --line:#23262b; }
+      * { box-sizing: border-box; }
+      body { margin:0; width:340px; background:var(--bg); color:var(--fg); font:12px/1.5 ui-monospace,Menlo,monospace; }
+      header { display:flex; justify-content:space-between; align-items:baseline; padding:12px 14px; border-bottom:1px solid var(--line); }
+      header b { font-size:13px; letter-spacing:.14em; text-transform:uppercase; }
+      header .n { color:var(--accent); font-weight:700; }
+      #queue { max-height:420px; overflow:auto; }
+      .empty { padding:24px 14px; color:var(--dim); }
+      .card { display:flex; gap:10px; padding:10px 14px; border-bottom:1px solid var(--line); }
+      .card .bar { width:3px; background:var(--accent); flex:none; }
+      .card .body { flex:1; min-width:0; }
+      .card .sfc { color:var(--dim); text-transform:uppercase; letter-spacing:.12em; font-size:10px; }
+      .card .pv { color:var(--fg); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+      .card .age { color:var(--dim); font-size:10px; }
+      footer { padding:10px 14px; border-top:1px solid var(--line); color:var(--dim); font-size:10px; }
+    </style>
+  </head>
+  <body>
+    <header><b>Staged</b><span class="n" id="count">—</span></header>
+    <div id="queue"><div class="empty">Loading…</div></div>
+    <footer>Draft-only. Nothing is sent without your click.</footer>
+    <script type="module" src="popup.js"></script>
+  </body>
+</html>

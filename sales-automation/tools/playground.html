@@ -1,0 +1,89 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>AE Automation — Intelligence Playground</title>
+    <style>
+      :root { --bg:#0e0f12; --fg:#d7dade; --dim:#6b7178; --accent:#e8a33d; --line:#23262b; --panel:#15171b; }
+      * { box-sizing: border-box; }
+      body { margin:0; background:var(--bg); color:var(--fg); font:13px/1.5 ui-monospace,Menlo,monospace; padding:24px; }
+      h1 { font-size:15px; letter-spacing:.14em; text-transform:uppercase; }
+      .sub { color:var(--dim); margin:-8px 0 20px; }
+      .grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(360px,1fr)); gap:18px; }
+      .panel { border:1px solid var(--line); background:var(--panel); padding:16px; }
+      .panel h2 { font-size:12px; letter-spacing:.12em; text-transform:uppercase; color:var(--accent); margin:0 0 12px; }
+      .field { display:flex; justify-content:space-between; align-items:center; gap:10px; margin:5px 0; }
+      .field label { color:var(--dim); }
+      input, select, textarea { background:#0e0f12; color:var(--fg); border:1px solid var(--line); padding:5px 7px; font:inherit; }
+      input[type=number] { width:90px; text-align:right; }
+      textarea { width:100%; height:110px; margin-top:6px; }
+      button { margin-top:12px; background:var(--accent); color:#15171b; border:0; padding:8px 16px; font:inherit; font-weight:700; letter-spacing:.06em; text-transform:uppercase; cursor:pointer; }
+      pre { background:#0b0c0e; border:1px solid var(--line); padding:12px; margin-top:12px; overflow:auto; max-height:280px; color:#bfe3b0; }
+    </style>
+  </head>
+  <body>
+    <h1>Intelligence Playground</h1>
+    <p class="sub">Same deterministic functions the live system uses. Change inputs, hit Run, read the output. Empty number field = unknown (not counted in coverage).</p>
+    <div class="grid">
+
+      <div class="panel">
+        <h2>Account scoring (ICP)</h2>
+        <div class="field"><label>Country</label><input id="country" type="text" value="Sweden" /></div>
+        <div class="field"><label>Industry</label><input id="industry" type="text" value="Computer Software" /></div>
+        <div class="field"><label>Employees</label><input id="emp" type="number" value="220" /></div>
+        <div class="field"><label>Incumbent CRM</label><select id="crm"><option value="">unknown</option><option value="pipedrive" selected>pipedrive</option><option value="none">none</option><option value="superoffice">superoffice</option><option value="salesforce">salesforce</option></select></div>
+        <div class="field"><label>New-hire title</label><input id="hireTitle" type="text" value="VP of Sales" /></div>
+        <div class="field"><label>hire (days ago)</label><input id="hireDays" type="number" value="35" /></div>
+        <div class="field"><label>funded (days ago)</label><input id="fundingDays" type="number" value="90" /></div>
+        <div class="field"><label>funding stage</label><select id="fundingStage"><option value="series-a" selected>series-a</option><option value="seed">seed</option><option value="debt">debt</option><option value="">unknown</option></select></div>
+        <div class="field"><label>headcount Δ% (2q)</label><input id="headcount" type="number" value="25" /></div>
+        <div class="field"><label>HubSpot PT</label><input id="ptScore" type="number" value="85" /></div>
+        <div class="field"><label>MHIT</label><input id="mhit" type="number" value="80" /></div>
+        <div class="field"><label># products w/ intent</label><input id="pi_count" type="number" value="2" /></div>
+        <div class="field"><label>freshest intent (days)</label><input id="pi_days" type="number" value="3" /></div>
+        <div class="field"><label>MR / 3M intent</label><span><input id="mr" type="number" value="72" style="width:60px" /> / <input id="tm" type="number" value="65" style="width:60px" /></span></div>
+        <div class="field"><label>page views</label><input id="pv" type="number" value="55" /></div>
+        <div class="field"><label>engagement</label><select id="engagement"><option value="">unknown</option><option value="positive" selected>positive</option><option value="none">none</option><option value="negative">negative</option></select></div>
+        <div class="field"><label>reachable buyer?</label><select id="reachable"><option value="yes" selected>yes</option><option value="no">no</option><option value="">unknown</option></select></div>
+        <div class="field"><label>another rep's?</label><select id="owned"><option value="">no</option><option value="yes">yes</option></select></div>
+        <div class="field"><label>entrenched Salesforce?</label><select id="sfdc"><option value="">no</option><option value="yes">yes</option></select></div>
+        <button id="scoreBtn">Run</button>
+        <pre id="scoreOut"></pre>
+      </div>
+
+      <div class="panel">
+        <h2>Install-base expansion</h2>
+        <div class="field"><label>seat utilization %</label><input id="seat" type="number" value="95" /></div>
+        <div class="field"><label>days to renewal</label><input id="renewal" type="number" value="60" /></div>
+        <div class="field"><label>user growth 90d %</label><input id="growth" type="number" value="40" /></div>
+        <div class="field"><label>health score (0–100)</label><input id="health" type="number" value="88" /></div>
+        <div class="field"><label>cross-sell gap (0–4)</label><input id="gap" type="number" value="3" /></div>
+        <button id="ibBtn">Run</button>
+        <pre id="ibOut"></pre>
+      </div>
+
+      <div class="panel">
+        <h2>Sourcing recipe</h2>
+        <label>Recipe (JSON)</label>
+        <textarea id="recipe">{ "contactMustMode": "any", "must": [ { "level": "company", "property": "Lead Status", "op": "is", "value": "Open" }, { "level": "company", "property": "Employees in Index", "op": "between", "value": [50, 1000] }, { "level": "contact", "property": "Job Title", "op": "contains", "value": "VP" } ], "boost": [ { "level": "company", "property": "Funding Date", "op": "within_days", "value": 180, "boost": "medium" } ] }</textarea>
+        <label>Account (JSON)</label>
+        <textarea id="account">{ "company": { "Lead Status": "Open", "Employees in Index": 200, "Funding Date": 90 }, "contacts": [ { "Job Title": "Account Executive" }, { "Job Title": "VP of Sales" } ] }</textarea>
+        <button id="sourcingBtn">Run</button>
+        <pre id="sourcingOut"></pre>
+      </div>
+
+      <div class="panel">
+        <h2>Gong deal-health</h2>
+        <div class="field"><label>rep talk %</label><input id="talk" type="number" value="78" /></div>
+        <div class="field"><label>has next step?</label><select id="nextstep"><option value="no" selected>no</option><option value="yes">yes</option></select></div>
+        <div class="field"><label>competitor mentions</label><input id="comp" type="number" value="2" /></div>
+        <div class="field"><label>sentiment</label><select id="sentiment"><option value="negative" selected>negative</option><option value="neutral">neutral</option><option value="positive">positive</option></select></div>
+        <div class="field"><label>days since last call</label><input id="since" type="number" value="20" /></div>
+        <button id="gongBtn">Run</button>
+        <pre id="gongOut"></pre>
+      </div>
+
+    </div>
+    <script src="playground.js"></script>
+  </body>
+</html>

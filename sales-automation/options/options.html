@@ -1,0 +1,49 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>AE Automation — Settings</title>
+    <style>
+      :root { --bg:#0e0f12; --fg:#d7dade; --dim:#6b7178; --accent:#e8a33d; --line:#23262b; }
+      * { box-sizing: border-box; }
+      body { margin:0; background:var(--bg); color:var(--fg); font:13px/1.6 ui-monospace,Menlo,monospace; padding:28px; max-width:560px; }
+      h1 { font-size:15px; letter-spacing:.14em; text-transform:uppercase; border-bottom:1px solid var(--line); padding-bottom:12px; }
+      .row { display:flex; flex-direction:column; gap:6px; margin:20px 0; }
+      label { color:var(--dim); text-transform:uppercase; letter-spacing:.1em; font-size:11px; }
+      select, input { background:#15171b; color:var(--fg); border:1px solid var(--line); padding:8px; font:inherit; }
+      .flag { color:var(--accent); }
+      button { margin-top:8px; background:var(--accent); color:#15171b; border:0; padding:9px 18px; font:inherit; font-weight:700; letter-spacing:.08em; text-transform:uppercase; cursor:pointer; }
+      #status { margin-top:12px; color:var(--accent); min-height:1em; }
+      .note { color:var(--dim); font-size:11px; margin-top:24px; border-top:1px solid var(--line); padding-top:12px; }
+    </style>
+  </head>
+  <body>
+    <h1>AE Automation</h1>
+    <div class="row">
+      <label for="mode">Deployment mode</label>
+      <select id="mode">
+        <option value="OBSERVE">OBSERVE — log only</option>
+        <option value="DRAFT">DRAFT — stage actions</option>
+      </select>
+    </div>
+    <div class="row"><label>Auto-send</label><div class="flag" id="autosend">—</div></div>
+    <div class="row">
+      <label for="tg">Telegram bot token</label>
+      <input id="tg" type="password" placeholder="paste token (stored locally only)" />
+    </div>
+    <button id="save">Save</button>
+    <div id="status"></div>
+
+    <h1 style="margin-top:36px">Diagnostics</h1>
+    <div class="row" style="flex-direction:row; flex-wrap:wrap; gap:10px">
+      <button id="seed">Seed demo queue</button>
+      <button id="bridge">Test Claude.ai bridge</button>
+      <button id="audit">Show audit tail</button>
+      <button id="clear">Clear all data</button>
+    </div>
+    <pre id="diag" style="background:#0b0c0e;border:1px solid var(--line);padding:12px;margin-top:12px;overflow:auto;max-height:280px;color:#bfe3b0;min-height:1em"></pre>
+
+    <div class="note">Draft-only by design. Auto-send stays OFF until you deliberately enable it. "Test bridge" opens a background claude.ai tab and runs one known-answer round-trip.</div>
+    <script type="module" src="options.js"></script>
+  </body>
+</html>
