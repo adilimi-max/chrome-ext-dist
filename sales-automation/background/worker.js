@@ -592,6 +592,8 @@
         tableStrategy: null,
         headerStrategy: null,
         rowSampled: 0,
+        headerCount: 0,
+        rawCellCounts: [],
         columns: [],
         mapMatches: [],
         samples: [],
@@ -604,7 +606,7 @@
         const norm = (s) => s.toLowerCase().replace(/\s+/g, " ").trim();
         const classify = (raw) => {
           const s = raw.trim();
-          if (!s) return "empty";
+          if (!s || s === "--" || s === "\u2014" || s === "-") return "empty";
           if (/@[\w.-]+\.\w+/.test(s)) return "email";
           if (/^[-+]?[\d.,\s%$€£]+$/.test(s)) return "num";
           if (/\d{4}-\d{2}-\d{2}/.test(s) || /\b\d{1,2}[/.]\d{1,2}[/.]\d{2,4}\b/.test(s) || /\b(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\b/i.test(s)) return "date";
@@ -644,21 +646,33 @@
           }
         }
         const sample = rows.slice(0, 12);
-        const colCount = Math.max(headers.length, ...sample.map((r2) => r2.querySelectorAll('td,[role="cell"],[role="gridcell"]').length), 0);
+        const headerCount = headers.length;
+        const alignedCells = (r2) => {
+          let cells = [...r2.querySelectorAll('td,[role="cell"],[role="gridcell"]')];
+          while (cells.length > headerCount && cells.length > 0) {
+            const c0 = cells[0];
+            const t0 = (c0.textContent ?? "").trim();
+            if (c0.querySelector('input[type="checkbox"]') || /^select row$/i.test(t0) || t0 === "") cells = cells.slice(1);
+            else break;
+          }
+          if (cells.length > headerCount) cells = cells.slice(cells.length - headerCount);
+          return cells;
+        };
+        const rawCellCounts = sample.slice(0, 3).map((r2) => r2.querySelectorAll('td,[role="cell"],[role="gridcell"]').length);
+        const aligned = sample.map(alignedCells);
         const columns = [];
-        for (let c = 0; c < colCount; c++) {
+        for (let c = 0; c < headerCount; c++) {
           const header = headers[c] ?? "";
           if (!header) continue;
           const counts = {};
           let nonEmpty2 = 0;
-          for (const r2 of sample) {
-            const cells = r2.querySelectorAll('td,[role="cell"],[role="gridcell"]');
+          for (const cells of aligned) {
             const cls = classify(cells[c]?.textContent ?? "");
             counts[cls] = (counts[cls] ?? 0) + 1;
             if (cls !== "empty") nonEmpty2++;
           }
           const dominant = Object.entries(counts).filter(([k]) => k !== "empty").sort((a, b) => b[1] - a[1])[0]?.[0] ?? "empty";
-          columns.push({ header, fill: sample.length ? +(nonEmpty2 / sample.length).toFixed(2) : 0, type: dominant });
+          columns.push({ header, fill: aligned.length ? +(nonEmpty2 / aligned.length).toFixed(2) : 0, type: dominant });
         }
         const REDACT = /* @__PURE__ */ new Set([
           "Company Description (Source of Truth)",
@@ -673,8 +687,7 @@
           if (/\+?\d[\d ()-]{7,}\d/.test(v)) return "[phone]";
           return v.length > 48 ? `${v.slice(0, 48)}\u2026` : v;
         };
-        const samples = sample.slice(0, 3).map((r2) => {
-          const cells = r2.querySelectorAll('td, [role="cell"], [role="gridcell"]');
+        const samples = aligned.slice(0, 3).map((cells) => {
           const o = {};
           headers.forEach((h, i) => {
             if (h) o[h] = maskVal(h, cells[i]?.textContent ?? "");
@@ -695,6 +708,8 @@
           tableStrategy,
           headerStrategy,
           rowSampled: sample.length,
+          headerCount,
+          rawCellCounts,
           columns,
           mapMatches,
           samples,
@@ -704,7 +719,7 @@
       args: [expectedPairs(DEFAULT_PROPERTY_MAP)]
     });
     const r = res?.result;
-    if (!r) return { tabUrl: tab.url ?? "", onHubspot: true, looksLikeIndex: false, tableStrategy: null, headerStrategy: null, rowSampled: 0, columns: [], mapMatches: [], samples: [], note: "No result from the HubSpot page (script blocked or page still loading). Make sure the list view is fully loaded, then retry." };
+    if (!r) return { tabUrl: tab.url ?? "", onHubspot: true, looksLikeIndex: false, tableStrategy: null, headerStrategy: null, rowSampled: 0, headerCount: 0, rawCellCounts: [], columns: [], mapMatches: [], samples: [], note: "No result from the HubSpot page (script blocked or page still loading). Make sure the list view is fully loaded, then retry." };
     const matched = r.mapMatches.filter((m) => m.found).length;
     r.note = !r.tableStrategy ? "Found a HubSpot tab but no table \u2014 open the open-pool LIST VIEW (the company index table), let it load, then retry." : r.columns.length === 0 ? `Table found (${r.tableStrategy}) but no labeled columns resolved \u2014 share this report so I can adjust the header selector.` : `OK \u2014 ${r.columns.length} labeled columns, ${matched}/${r.mapMatches.length} expected properties matched. Share this report + tell me any column names I should map.`;
     return r;
@@ -1100,6 +1115,7 @@
         const table = document.querySelector('[data-test-id="table"], [role="grid"], [role="table"], table') ?? document;
         const headerEls = [...table.querySelectorAll('[data-test-id*="column-header"], [role="columnheader"], thead th, th')];
         const headers = headerEls.map((h) => (h.textContent ?? "").replace(/\s+/g, " ").trim());
+        const headerCount = headers.length;
         const rowEls = [...table.querySelectorAll('tbody tr, [role="row"]')].filter(
           (r) => r.querySelector('td, [role="cell"], [role="gridcell"]')
         );
@@ -1111,11 +1127,26 @@
           }
           return "";
         };
+        const alignedCells = (r) => {
+          let cells = [...r.querySelectorAll('td, [role="cell"], [role="gridcell"]')];
+          while (cells.length > headerCount && cells.length > 0) {
+            const c0 = cells[0];
+            const t0 = (c0.textContent ?? "").trim();
+            if (c0.querySelector('input[type="checkbox"]') || /^select row$/i.test(t0) || t0 === "") cells = cells.slice(1);
+            else break;
+          }
+          if (cells.length > headerCount) cells = cells.slice(cells.length - headerCount);
+          return cells;
+        };
+        const clean = (s) => {
+          const v = (s ?? "").replace(/\s+/g, " ").trim();
+          return v === "--" || v === "\u2014" || v === "-" ? "" : v;
+        };
         return rowEls.map((r) => {
-          const cells = [...r.querySelectorAll('td, [role="cell"], [role="gridcell"]')];
+          const cells = alignedCells(r);
           const row = {};
           headers.forEach((h, i) => {
-            if (h) row[h] = (cells[i]?.textContent ?? "").replace(/\s+/g, " ").trim();
+            if (h) row[h] = clean(cells[i]?.textContent ?? "");
           });
           return { objectId: idFrom(r), row };
         });
