@@ -1114,13 +1114,35 @@
     const [res] = await chrome.scripting.executeScript({
       target: { tabId },
       func: () => {
-        const table = document.querySelector('[data-test-id="table"], [role="grid"], [role="table"], table') ?? document;
-        const headerEls = [...table.querySelectorAll('[data-test-id*="column-header"], [role="columnheader"], thead th, th')];
+        const tableSels = ['[data-test-id="table"]', '[role="grid"]', '[role="table"]', "table"];
+        let table = document;
+        for (const s of tableSels) {
+          const el = document.querySelector(s);
+          if (el) {
+            table = el;
+            break;
+          }
+        }
+        const headerSels = ['[data-test-id*="column-header"]', '[role="columnheader"]', "thead th", "th"];
+        let headerEls = [];
+        for (const s of headerSels) {
+          const els = [...table.querySelectorAll(s)];
+          if (els.length) {
+            headerEls = els;
+            break;
+          }
+        }
         const headers = headerEls.map((h) => (h.textContent ?? "").replace(/\s+/g, " ").trim());
         const headerCount = headers.length;
-        const rowEls = [...table.querySelectorAll('tbody tr, [role="row"]')].filter(
-          (r) => r.querySelector('td, [role="cell"], [role="gridcell"]')
-        );
+        const rowSels = ["tbody tr", '[role="row"]', "tr"];
+        let rowEls = [];
+        for (const s of rowSels) {
+          const els = [...table.querySelectorAll(s)].filter((r) => r.querySelector('td, [role="cell"], [role="gridcell"]'));
+          if (els.length) {
+            rowEls = els;
+            break;
+          }
+        }
         const idFrom = (r) => {
           for (const a of r.querySelectorAll("a[href]")) {
             const href = a.getAttribute("href") ?? "";
