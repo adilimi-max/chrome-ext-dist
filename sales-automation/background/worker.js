@@ -429,51 +429,38 @@
 
   // src/shared/scrapers/hubspot-map.ts
   var DEFAULT_PROPERTY_MAP = {
-    recordId: "Record ID",
-    ptScore: "HubSpot PT Score",
-    mhit: "MHIT Score",
-    mrIntent: "MR Account Intent Score (66 MR)",
-    threeMonthIntent: "3M Account Intent Score (66 3M)",
-    pageViews: "Page Views",
-    fundingDate: "Funding Date",
-    employees: "Employees in Index",
-    employeesAlt: "HS Employees",
-    hubs: [
-      { signal: "Sales Hub Intent Signal", date: "Sales Hub Intent Date" },
-      { signal: "Service Hub Intent Signal", date: "Service Hub Intent Date" },
-      { signal: "Marketing Hub Intent Signal", date: "Marketing Hub Intent Date" },
-      { signal: "CRM Intent Signal", date: "CRM Intent Date" }
-    ],
-    engagement: "Engagement",
-    jobChangeTitle: "U5 New Job Title",
-    country: "Country",
-    industry: "HS Primary Industry",
-    lifecycleStage: "Lifecycle Stage"
+    name: "Company name",
+    domain: "Company Domain Name",
+    industry: "Industry (Source of Truth)",
+    industryAlt: "Industry (Breeze Intelligence)",
+    annualRevenue: "Annual Revenue (Source of Truth)",
+    description: "Company Description (Source of Truth)",
+    employees: "Number of Employees",
+    predictedMrr: "Prospect Value Score Predicted MRR 6 months",
+    fitScore: "HubSpot Fit Score",
+    reasonsDetails: "Compelling Reasons to Reach Out - Details",
+    reasonsSummary: "Compelling Reasons to Reach Out - Summary",
+    territory: "Company Info Territory",
+    owner: "Company owner"
   };
 
   // src/background/hubspot-diag.ts
   function expectedPairs(pm) {
-    const pairs = [
-      { field: "recordId", expected: pm.recordId },
-      { field: "ptScore", expected: pm.ptScore },
-      { field: "mhit", expected: pm.mhit },
-      { field: "mrIntent", expected: pm.mrIntent },
-      { field: "threeMonthIntent", expected: pm.threeMonthIntent },
-      { field: "pageViews", expected: pm.pageViews },
-      { field: "fundingDate", expected: pm.fundingDate },
-      { field: "employees", expected: pm.employees },
-      { field: "employeesAlt", expected: pm.employeesAlt },
-      { field: "engagement", expected: pm.engagement },
-      { field: "jobChangeTitle", expected: pm.jobChangeTitle },
-      { field: "country", expected: pm.country },
+    return [
+      { field: "name", expected: pm.name },
+      { field: "domain", expected: pm.domain },
       { field: "industry", expected: pm.industry },
-      { field: "lifecycleStage", expected: pm.lifecycleStage }
+      { field: "industryAlt", expected: pm.industryAlt },
+      { field: "annualRevenue", expected: pm.annualRevenue },
+      { field: "description", expected: pm.description },
+      { field: "employees", expected: pm.employees },
+      { field: "predictedMrr", expected: pm.predictedMrr },
+      { field: "fitScore", expected: pm.fitScore },
+      { field: "reasonsDetails", expected: pm.reasonsDetails },
+      { field: "reasonsSummary", expected: pm.reasonsSummary },
+      { field: "territory", expected: pm.territory },
+      { field: "owner", expected: pm.owner }
     ];
-    pm.hubs.forEach((h, i) => {
-      pairs.push({ field: `hub${i}.signal`, expected: h.signal });
-      pairs.push({ field: `hub${i}.date`, expected: h.date });
-    });
-    return pairs;
   }
   async function findHubspotTab() {
     const tabs = await chrome.tabs.query({ url: ["*://*.hubspot.com/*"] });

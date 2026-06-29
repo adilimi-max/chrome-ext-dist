@@ -1,5 +1,63 @@
 "use strict";
 (() => {
+  // src/shared/scrape-util.ts
+  var canonicalizeNumeric = (raw) => {
+    const s = raw.replace(/\s/g, "");
+    const lastComma = s.lastIndexOf(",");
+    const lastDot = s.lastIndexOf(".");
+    if (lastComma === -1 && lastDot === -1) return s;
+    const decChar = lastComma > lastDot ? "," : ".";
+    const decPos = Math.max(lastComma, lastDot);
+    const trailing = s.length - decPos - 1;
+    const groupChar = decChar === "," ? "." : ",";
+    const hasGroup = s.indexOf(groupChar) !== -1;
+    const decimalSeparatorCount = (s.match(decChar === "," ? /,/g : /\./g) ?? []).length;
+    const isDecimal = trailing >= 1 && trailing <= 2 && (hasGroup || decimalSeparatorCount === 1) && !(trailing === 3);
+    let out;
+    if (isDecimal) {
+      out = s.split(groupChar).join("").replace(decChar, "#").replace(/[,.]/g, "").replace("#", ".");
+    } else {
+      out = s.replace(/[,.]/g, "");
+    }
+    return out;
+  };
+  var num = (s) => {
+    if (s == null) return null;
+    if (typeof s === "number") return Number.isFinite(s) ? s : null;
+    const kept = s.replace(/[^0-9.,+-]/g, "");
+    const sign = /^-/.test(s.trim()) ? "-" : "";
+    const t = sign + canonicalizeNumeric(kept.replace(/[+-]/g, ""));
+    if (t === "" || t === "-" || t === "+" || t === ".") return null;
+    const n = Number(t);
+    return Number.isFinite(n) ? n : null;
+  };
+  var MAG = { k: 1e3, m: 1e6, b: 1e9, t: 1e12 };
+  var parseMoneyToken = (raw) => {
+    const t = raw.trim().toLowerCase().replace(/[$€£¥\s]/g, "").replace(/usd|eur|gbp|sek|nok|dkk/g, "");
+    const mm = t.match(/(-?\d[\d.,]*)\s*([kmbt])?/);
+    if (!mm) return null;
+    const n = num(mm[1]);
+    if (n == null) return null;
+    return mm[2] ? n * MAG[mm[2]] : n;
+  };
+  var parseRevenue = (text) => {
+    if (text == null) return null;
+    const s = text.trim();
+    if (s === "" || /^(unknown|n\/?a|-|–|—|none|null)$/i.test(s)) return null;
+    const range = s.match(/^(.*?\d[kmbt]?)\s*(?:[-–—]|\bto\b)\s*(\d.*)$/i);
+    if (range) {
+      const hi = parseMoneyToken(range[2]);
+      let loRaw = range[1].trim();
+      if (hi != null && !/[kmbt]\s*$/i.test(loRaw)) {
+        const hiSuffix = range[2].trim().match(/([kmbt])\s*$/i);
+        if (hiSuffix) loRaw = loRaw + hiSuffix[1];
+      }
+      const lo = parseMoneyToken(loRaw);
+      if (lo != null && hi != null) return (lo + hi) / 2;
+    }
+    return parseMoneyToken(s);
+  };
+
   // src/shared/scoring-signals.ts
   function piecewise(x, pts) {
     if (x <= pts[0][0]) return pts[0][1];
@@ -14,134 +72,83 @@
     }
     return last[1];
   }
-  function recency(days, full, zero) {
-    if (days == null || days < 0) return 0;
-    if (days <= full) return 1;
-    if (days >= zero) return 0;
-    return 1 - (days - full) / (zero - full);
+  function fitNorm(fitScore) {
+    if (fitScore == null || !Number.isFinite(fitScore)) return null;
+    const lin = Math.max(0, Math.min(1, (fitScore - 1) / 9));
+    return 0.6 * lin + 0.4 * lin * lin;
   }
-  var GTM_FN = /\b(sales|revenue|revops|rev ops|marketing|growth|commercial|demand[\s-]?gen|cco|cro|cmo|cso)\b/i;
-  var NORDIC_GTM = /(försäljnings|forsaljnings|salgs|myynti|markkinointi|marknads|kommersiel)/i;
-  var ANTI_FN = /\b(cfo|cto|coo|chro|controller|ciso|finance|financial|engineering|product|people|\bhr\b|talent)\b/i;
-  var SENIOR = /\b(chief|c[a-z]o\b|vp|vice president|svp|evp|head of|director|direkt[oö]r|chef|johtaja|lead of)\b/i;
-  var MID = /\b(manager|chef|lead|principal)\b/i;
-  function hireMomentum(title, daysAgo) {
-    if (!title || !title.trim()) return 0;
-    const t = title.toLowerCase();
-    const isGtm = GTM_FN.test(t) || NORDIC_GTM.test(t);
-    if (!isGtm) return ANTI_FN.test(t) ? 0 : 0.05;
-    const seniority = SENIOR.test(t) ? 1 : MID.test(t) ? 0.5 : 0.25;
-    const r = daysAgo == null ? 0.5 : daysAgo < 10 ? 0.8 * recency(daysAgo, 120, 150) : recency(daysAgo, 120, 150);
-    return seniority * r;
+  var DEFAULT_MRR_K = 1e3;
+  function valueNorm(mrr, k = DEFAULT_MRR_K) {
+    if (mrr == null || !Number.isFinite(mrr) || mrr < 0) return null;
+    const kk = k > 0 ? k : DEFAULT_MRR_K;
+    return mrr / (mrr + kk);
   }
-  var FULL_STAGES = /* @__PURE__ */ new Set(["seed", "series-a", "series_a", "series-b", "series_b", "growth", "growth-equity"]);
-  var WEAK_STAGES = /* @__PURE__ */ new Set(["pre-seed", "pre_seed", "late", "series-c", "series-d", "ipo"]);
-  var NON_GTM_FUNDING = /* @__PURE__ */ new Set(["debt", "grant", "bridge", "down-round"]);
-  function fundingMomentum(daysAgo, stage) {
-    if (daysAgo == null || daysAgo < 0) return 0;
-    const s = (stage ?? "").toLowerCase().replace(/\s+/g, "-");
-    if (NON_GTM_FUNDING.has(s)) return 0;
-    const stageMult = FULL_STAGES.has(s) ? 1 : WEAK_STAGES.has(s) ? 0.4 : 0.7;
-    return stageMult * recency(daysAgo, 180, 270);
-  }
-  function headcountMomentum(deltaPct) {
-    if (deltaPct == null) return 0;
-    return piecewise(deltaPct, [[0, 0], [10, 0.3], [20, 0.7], [40, 1], [100, 1]]);
-  }
-  function gtmMomentum(parts) {
-    const xs = [parts.hire, parts.funding, parts.headcount].sort((a, b) => b - a);
-    const corroboration = 0.15 * (xs.filter((x) => x > 0.2).length - 1 > 0 ? xs.filter((x) => x > 0.2).length - 1 : 0);
-    return Math.min(1, xs[0] + corroboration);
-  }
-  var PT_PTS = [[0, 0], [20, 0.2], [40, 0.4], [60, 0.7], [80, 1], [100, 1]];
-  var MHIT_PTS = [[0, 0], [40, 0.4], [60, 0.667], [80, 1], [100, 1]];
-  var MR_PTS = [[0, 0], [30, 0.333], [50, 0.667], [70, 1], [100, 1]];
-  var TM_PTS = [[0, 0], [30, 0.3], [50, 0.7], [70, 1], [100, 1]];
-  var PV_PTS = [[0, 0], [5, 0.375], [20, 0.625], [50, 1]];
-  function intentComposite(p) {
-    const intentRecency = recency(p.productDaysAgo, 30, 90);
-    const subs = [];
-    if (p.pt != null) subs.push(piecewise(p.pt, PT_PTS));
-    if (p.mhit != null) subs.push(piecewise(p.mhit, MHIT_PTS));
-    if (p.productCount > 0) subs.push(Math.min(1, p.productCount / 3) * (0.5 + 0.5 * intentRecency));
-    if (p.pageViews != null) subs.push(piecewise(p.pageViews, PV_PTS) * (0.4 + 0.6 * intentRecency));
-    if (p.mr != null) {
-      const level = piecewise(p.mr, MR_PTS);
-      const momentum = p.threeM != null ? Math.max(0, Math.min(0.2, (p.mr - p.threeM) / 100)) : 0;
-      subs.push(Math.min(1, level * 0.85 + momentum));
-    } else if (p.threeM != null) {
-      subs.push(piecewise(p.threeM, TM_PTS) * 0.7);
+  var SIZE_PTS = [[0, 0], [50, 1], [500, 1], [1e3, 0.4], [3e3, 0.1]];
+  function sizeFitNorm(employees, revenue) {
+    if (employees == null || !Number.isFinite(employees) || employees < 0) return null;
+    let v = piecewise(employees, SIZE_PTS);
+    if (revenue != null && Number.isFinite(revenue) && revenue > 0 && employees > 0) {
+      const perHead = revenue / employees;
+      if (perHead < 15e3) v -= 0.05;
+      else if (perHead > 2e6) v -= 0.05;
     }
-    subs.sort((a, b) => b - a);
-    const w = [1, 0.45, 0.25, 0.15, 0.1];
-    const raw = subs.reduce((s, v, i) => s + v * (w[i] ?? 0.05), 0);
-    return Math.min(1, raw);
+    return Math.max(0, Math.min(1, v));
   }
-  var OVERINDEX = /(software|saas|information technology|it services|internet|professional services|e-?commerce|fintech|financial technology|health ?tech|technology)/i;
-  var SIZE_PTS = [[0, 0], [30, 0.5], [50, 1], [500, 1], [600, 0.5], [1e3, 0.1]];
-  function industrySizeFit(industry, employees) {
-    const sizeCurve = employees == null ? 0.5 : piecewise(employees, SIZE_PTS);
-    const industryMult = industry == null ? 0.6 : OVERINDEX.test(industry) ? 1 : 0.5;
-    return sizeCurve * industryMult;
+  var INDUSTRY_HIGH = /(software|saas|information technology|it services|internet|tech(nology)?|professional services|marketing|advertis|e-?commerce|media|publishing|fintech|financial technology)/i;
+  var INDUSTRY_LOW = /(manufactur|heavy industry|industrial|construction|government|public sector|non-?profit|education|university|school|mining|agricultur|oil|gas|utilities)/i;
+  function industryFitNorm(industry, industryAlt) {
+    const s = industry && industry.trim() || industryAlt && industryAlt.trim() || "";
+    if (!s) return null;
+    if (INDUSTRY_HIGH.test(s)) return 1;
+    if (INDUSTRY_LOW.test(s)) return 0.25;
+    return 0.5;
   }
-  var DISPLACEABLE = /* @__PURE__ */ new Set(["none", "pipedrive", "zoho", "superoffice", "lime", "upsales", "hubspot-free", "hubspot-starter"]);
-  var ENTRENCHED = /* @__PURE__ */ new Set(["salesforce", "dynamics", "ms-dynamics"]);
-  function crmDisplaceability(crm) {
-    const c = (crm ?? "unknown").toLowerCase();
-    if (DISPLACEABLE.has(c)) return 1;
-    if (ENTRENCHED.has(c)) return 0.1;
-    return 0.4;
-  }
-  var isOverIndexIndustry = (s) => s != null && OVERINDEX.test(s);
-  var isEntrenchedCrm = (c) => ENTRENCHED.has((c ?? "").toLowerCase());
-  function engagementNorm(e) {
-    if (e === "negative") return -1;
-    if (e === "positive") return 0.7;
+  var isHighFitIndustry = (industry, alt) => {
+    const s = industry && industry.trim() || alt && alt.trim() || "";
+    return !!s && INDUSTRY_HIGH.test(s);
+  };
+  var STRONG_INTENT_RE = /(\bfunding\b|\braised\b|\braise\b|\bseries\s?[a-e]\b|\bseed\b|\bhiring\b|\bhire\b|\bexpand\b|\bexpansion\b|\bnew\s+(vp|chief|head|director)\b|\bscaling\b|\bscale[\s-]?up\b|\bmigrat|\bgrowth\b|\blaunch\b)/i;
+  function whyNowNorm(newHire, reasonsText) {
+    if (newHire === true) return 1;
+    const t = (reasonsText ?? "").trim();
+    if (t && STRONG_INTENT_RE.test(t)) return 0.5;
     return 0;
-  }
-  function contentEngagementNorm(ce) {
-    if (!ce) return 0;
-    const fresh = recency(ce.lastViewedDaysAgo ?? null, 7, 30);
-    const dwell = ce.dwellSec == null ? 0 : piecewise(ce.dwellSec, [[0, 0], [30, 0.3], [120, 0.7], [300, 1]]);
-    const base = Math.max(dwell, ce.forwarded ? 0.9 : 0);
-    return base * (0.4 + 0.6 * fresh);
   }
 
   // src/shared/scoring.ts
   var WEIGHTS = {
-    gtmMomentum: 30,
-    // funding + GTM hire + headcount, collapsed (the user's headline signal)
-    intentComposite: 26,
-    // de-correlated native intent (was 72 of double-counting)
-    industrySizeFit: 20,
-    // HubSpot-shaped vertical x 50-500 sweet-spot curve
-    crmDisplacement: 14,
-    // confidence-weighted (never assume greenfield)
-    engagement: 10
-    // asymmetric suppressor
+    fitSignal: 35,
+    // HubSpot's native FIT model
+    valueSignal: 30,
+    // HubSpot's predicted-MRR VALUE model
+    sizeFit: 15,
+    // 50-500 mid-market band
+    industryFit: 10,
+    // HubSpot-shaped vertical
+    whyNow: 10
+    // optional trigger (additive — never lowers)
   };
-  var WEIGHT_ORDER = ["gtmMomentum", "intentComposite", "industrySizeFit", "crmDisplacement", "engagement"];
-  function tierOf(score2) {
-    if (score2 >= 75) return "HOT";
-    if (score2 >= 50) return "WARM";
-    if (score2 >= 30) return "NURTURE";
+  var WEIGHT_ORDER = ["fitSignal", "valueSignal", "sizeFit", "industryFit", "whyNow"];
+  var DEFAULT_SCORING_CONFIG = {
+    mrrK: DEFAULT_MRR_K,
+    // CALIBRATION KNOB — tune ONCE against the OBSERVE MRR distribution (~ pool median)
+    allowedTerritories: ["EMEA/Mid Market/Nordics"],
+    openOwnerValue: "Open Account (Salesforce)"
+  };
+  function tierOf(score) {
+    if (score >= 75) return "HOT";
+    if (score >= 50) return "WARM";
+    if (score >= 30) return "NURTURE";
     return "SKIP";
   }
-  function score(inputs) {
-    if (inputs.length !== WEIGHT_ORDER.length) {
-      throw new RangeError(`score() expects ${WEIGHT_ORDER.length} dimension inputs, got ${inputs.length}`);
-    }
-    let total = 0;
-    for (let i = 0; i < WEIGHT_ORDER.length; i++) total += inputs[i] * WEIGHTS[WEIGHT_ORDER[i]];
-    return total;
-  }
+  var COVERAGE_FLOOR = 0.3;
   var round = (n, dp = 1) => {
     const f = 10 ** dp;
     return Math.round(n * f) / f;
   };
   var RANK = { SKIP: 0, NURTURE: 1, WARM: 2, HOT: 3 };
   var BY_RANK = ["SKIP", "NURTURE", "WARM", "HOT"];
-  var NORDIC_CCTLD = /* @__PURE__ */ new Set([".se", ".no", ".dk", ".fi", ".is"]);
+  var normTerritory = (s) => (s ?? "").trim().toLowerCase();
   function applyTierCaps(tier, f) {
     let cap = RANK.HOT;
     const caps = [];
@@ -149,92 +156,103 @@
       if (RANK[tier] > max) caps.push(label);
       cap = Math.min(cap, max);
     };
-    if (f.notWorkable) apply(RANK.SKIP, "not yours to work");
-    if (f.antiFit) apply(RANK.SKIP, "agency / HubSpot partner");
-    if (f.entrenchedSfdc) apply(RANK.NURTURE, "entrenched Salesforce at scale");
-    if (f.foreignSubsidiary) apply(RANK.NURTURE, "no-autonomy subsidiary");
-    if (!f.hasLiveTrigger) apply(RANK.NURTURE, "no live why-now (stale)");
-    if (f.anonymous) apply(RANK.NURTURE, "no reachable buyer");
-    if (f.dangerCell) apply(RANK.WARM, "looks like a Salesforce target \u2014 verify");
-    if (f.lowConfidenceGeo) apply(RANK.WARM, "geography unconfirmed");
-    if (f.enrichmentOnly) apply(RANK.WARM, "enrichment-only \u2014 needs a native signal");
+    if (f.territoryMismatch) apply(RANK.SKIP, "outside Nordics territory");
+    if (f.ownedByRep) apply(RANK.SKIP, "already owned by a rep");
+    if (f.lowConfidence) apply(RANK.WARM, "no Fit/MRR evidence \u2014 low confidence");
+    if (f.lacksValueEvidence) apply(RANK.WARM, "no value (MRR) evidence \u2014 not a top call");
+    if (f.thinEvidence) apply(RANK.NURTURE, "thin evidence \u2014 single weak signal");
     return { tier: BY_RANK[Math.min(RANK[tier], cap)], caps };
   }
-  function computeFlags(input, m) {
-    const lifecycle = (input.lifecycleStage ?? "").toLowerCase();
-    const nativeIntent = input.ptScore != null || input.mhit != null || input.mrAccountIntent != null || input.engagement != null || input.productIntents.some((p) => p.hasIntent);
-    const crm = (input.currentCrm ?? "unknown").toLowerCase();
-    const ce = input.contentEngagement ?? null;
-    const liveContentView = ce != null && (ce.forwarded || (ce.dwellSec ?? 0) > 0) && (ce.lastViewedDaysAgo == null || ce.lastViewedDaysAgo <= 14);
-    const detectedSfdcConfident = isEntrenchedCrm(crm) && (input.currentCrmConfidence !== "low" || (input.competitorMentions ?? 0) >= 1);
+  function computeFlags(input, cfg, hasWhyNow, valuePresent, coverage) {
+    const allowed = new Set(cfg.allowedTerritories.map(normTerritory));
+    const terr = normTerritory(input.territory);
+    const owner = (input.owner ?? "").trim();
     return {
-      hasLiveTrigger: m.hire > 0.25 || m.funding > 0.25 || m.headcount > 0.25 || m.freshestIntent != null && m.freshestIntent <= 90 || liveContentView,
-      lowConfidenceGeo: input.country == null,
-      enrichmentOnly: !nativeIntent && ce == null && (input.fundingDaysAgo != null || input.currentCrm != null || input.headcountDeltaPct != null),
-      antiFit: input.isPartner === true,
-      notWorkable: input.ownedByOther === true || ["customer", "evangelist", "opportunity"].includes(lifecycle),
-      anonymous: input.reachableBuyer === false && !liveContentView,
-      // an active content viewer is reachable
-      entrenchedSfdc: input.entrenchedSalesforce === true || detectedSfdcConfident,
-      foreignSubsidiary: input.isForeignSubsidiary === true,
-      dangerCell: (m.funding > 0.3 || m.headcount > 0.3) && (crm === "unknown" || isEntrenchedCrm(crm)) && !isOverIndexIndustry(input.industry)
+      hasWhyNow,
+      // lowConfidence = NO Fit AND NO MRR evidence. A reported MRR of 0 IS evidence (low-value), so it
+      // does NOT count as missing here — only a null/absent MRR does. (negative = invalid data => absent.)
+      lowConfidence: input.fitScore == null && (input.predictedMrr == null || input.predictedMrr < 0),
+      // No VALUE evidence at all => cannot be HOT (a top call needs both fit AND value). valuePresent is
+      // the valueNorm result presence (a reported 0 IS present evidence; only null/absent counts as missing).
+      lacksValueEvidence: !valuePresent,
+      // A lone weak dimension (coverage below the floor — e.g. only industryFit/sizeFit present) is too
+      // thin to justify more than NURTURE, even though re-normalization inflates its score.
+      thinEvidence: coverage > 0 && coverage < COVERAGE_FLOOR,
+      territoryMismatch: terr !== "" && !allowed.has(terr),
+      ownedByRep: owner !== "" && owner.trim().toLowerCase() !== cfg.openOwnerValue.trim().toLowerCase()
     };
   }
-  function buildSignals(input, m) {
+  function buildSignals(input, norms) {
     const out = [];
-    if (m.hire > 0.3) out.push(`Fresh GTM-leadership hire${input.jobChangeTitle ? ` (${input.jobChangeTitle})` : ""}`);
-    if (m.funding > 0.3) out.push(`Recent funding${input.fundingStage ? ` (${input.fundingStage})` : ""}`);
-    if (m.headcount > 0.3) out.push(`Headcount growing +${input.headcountDeltaPct}%`);
-    if (isOverIndexIndustry(input.industry)) out.push(`HubSpot-shaped vertical (${input.industry})`);
-    if (input.currentCrm && crmDisplaceability(input.currentCrm) >= 0.9) out.push(`On a displaceable CRM (${input.currentCrm})`);
-    if (input.engagement === "positive") out.push("Positive engagement");
-    if (input.engagement === "negative") out.push("Negative engagement (suppressed)");
+    if (input.fitScore != null) out.push(`HubSpot Fit Score ${input.fitScore}/10`);
+    if (input.predictedMrr != null && input.predictedMrr > 0) out.push(`Predicted MRR ${Math.round(input.predictedMrr)}`);
+    if (isHighFitIndustry(input.industry, input.industryAlt)) {
+      out.push(`HubSpot-shaped vertical (${input.industry || input.industryAlt})`);
+    }
+    if (input.employeeCount != null) out.push(`${input.employeeCount} employees`);
+    if (input.newHire === true) out.push("New GTM-leadership hire (LinkedIn signal)");
+    else if (norms.whyNow != null && norms.whyNow > 0) out.push("Compelling reason to reach out");
     return out;
   }
-  function scoreAccount(input) {
-    const intentful = input.productIntents.filter((p) => p.hasIntent);
-    const days = intentful.map((p) => p.daysSinceSignal).filter((d) => d != null);
-    const freshestIntent = days.length ? Math.min(...days) : null;
-    const hire = input.jobChangeTitle != null ? hireMomentum(input.jobChangeTitle, input.jobChangeDaysAgo ?? null) : input.jobChange === "leadership" ? 0.55 : input.jobChange === "other" ? 0.15 : 0;
-    const funding = fundingMomentum(input.fundingDaysAgo, input.fundingStage);
-    const headcount = headcountMomentum(input.headcountDeltaPct);
-    const norms = {
-      gtmMomentum: gtmMomentum({ hire, funding, headcount }),
-      intentComposite: intentComposite({ pt: input.ptScore, mhit: input.mhit, productCount: intentful.length, productDaysAgo: freshestIntent, mr: input.mrAccountIntent, threeM: input.threeMonthIntent, pageViews: input.pageViews }),
-      industrySizeFit: industrySizeFit(input.industry, input.employeeCount),
-      crmDisplacement: crmDisplaceability(input.currentCrm),
-      // A genuine "unsubscribe" stays dominant; otherwise take the strongest of email-polarity and
-      // Seismic content engagement (a forwarded asset is a strong, de-correlated warmth signal).
-      engagement: input.engagement === "negative" ? -1 : Math.max(engagementNorm(input.engagement), contentEngagementNorm(input.contentEngagement))
+  function scoreAccount(input, cfg = DEFAULT_SCORING_CONFIG) {
+    const revenue = input.annualRevenue;
+    const whyNow = whyNowNorm(input.newHire, input.reasonsText);
+    const rawNorms = {
+      fitSignal: fitNorm(input.fitScore),
+      valueSignal: valueNorm(input.predictedMrr, cfg.mrrK),
+      sizeFit: sizeFitNorm(input.employeeCount, revenue),
+      industryFit: industryFitNorm(input.industry, input.industryAlt),
+      // null when industry is unknown/blank
+      whyNow
+      // additive-only: 0 when absent (does not lower the score)
     };
-    const dims = WEIGHT_ORDER.map((k) => norms[k]);
-    const corro = (NORDIC_CCTLD.has((input.domainCcTld ?? "").toLowerCase()) ? 2 : 0) + (input.trafficTrendUp ? 2 : 0);
-    const clamped = Math.max(0, Math.min(100, score(dims) + corro));
-    const flags = computeFlags(input, { hire, funding, headcount, freshestIntent });
+    const evidenceKeys = ["fitSignal", "valueSignal", "sizeFit", "industryFit"];
+    let presentWeight = 0;
+    let weighted = 0;
+    for (const k of evidenceKeys) {
+      const v = rawNorms[k];
+      if (v != null) {
+        presentWeight += WEIGHTS[k];
+        weighted += v * WEIGHTS[k];
+      }
+    }
+    const evidenceBudget = 100 - WEIGHTS.whyNow;
+    const evidenceScore = presentWeight > 0 ? weighted / presentWeight * evidenceBudget : 0;
+    const whyNowScore = whyNow * WEIGHTS.whyNow;
+    const clamped = Math.max(0, Math.min(100, evidenceScore + whyNowScore));
+    let covWeight = presentWeight;
+    if (whyNow > 0) covWeight += WEIGHTS.whyNow;
+    const coverage = covWeight / 100;
+    const flags = computeFlags(input, cfg, whyNow > 0, rawNorms.valueSignal != null, coverage);
     const baseTier = tierOf(clamped);
     const { tier, caps } = applyTierCaps(baseTier, flags);
-    const present = {
-      gtmMomentum: input.fundingDaysAgo != null || input.jobChange != null || input.jobChangeTitle != null || input.headcountDeltaPct != null,
-      intentComposite: input.ptScore != null || input.mhit != null || input.mrAccountIntent != null || input.threeMonthIntent != null || input.pageViews != null || intentful.length > 0,
-      industrySizeFit: input.industry != null || input.employeeCount != null,
-      crmDisplacement: input.currentCrm != null,
-      engagement: input.engagement != null || input.contentEngagement != null
-    };
-    const presentWeight = WEIGHT_ORDER.reduce((s, k) => s + (present[k] ? WEIGHTS[k] : 0), 0);
-    const coverage = presentWeight / 100;
+    const inputs = WEIGHT_ORDER.map((k) => rawNorms[k] ?? 0);
+    const evScale = presentWeight > 0 ? evidenceBudget / presentWeight : 0;
     const breakdown = {};
-    for (const k of WEIGHT_ORDER) breakdown[k] = round(norms[k] * WEIGHTS[k]);
+    const nominalBreakdown = {};
+    for (const k of WEIGHT_ORDER) {
+      if (k === "whyNow") {
+        breakdown[k] = round(whyNowScore);
+        nominalBreakdown[k] = round(whyNowScore);
+      } else {
+        breakdown[k] = round((rawNorms[k] ?? 0) * WEIGHTS[k] * evScale);
+        nominalBreakdown[k] = round((rawNorms[k] ?? 0) * WEIGHTS[k]);
+      }
+    }
+    const breakdownRescaled = presentWeight > 0 && presentWeight < evidenceBudget;
     return {
       score: round(clamped),
       tier,
       baseTier,
       caps,
       breakdown,
+      nominalBreakdown,
+      breakdownRescaled,
       coverage: round(coverage, 2),
-      confidence: coverage >= 0.6 ? "HIGH" : coverage >= 0.35 ? "MEDIUM" : "LOW",
+      confidence: flags.lowConfidence ? "LOW" : coverage >= 0.6 ? "HIGH" : coverage >= 0.35 ? "MEDIUM" : "LOW",
       flags,
-      signals: buildSignals(input, { hire, funding, headcount }),
-      inputs: dims
+      signals: buildSignals(input, rawNorms),
+      inputs
     };
   }
 
@@ -278,15 +296,15 @@
       healthScore: part(input.healthScore, HEALTH_PTS),
       crossSellGap: part(input.crossSellGap, GAP_PTS, (v) => v >= 1 ? `${v} product gap` : void 0)
     };
-    let score2 = 0;
+    let score = 0;
     let presentWeight = 0;
     const breakdown = {};
     for (const k of IB_ORDER) {
-      score2 += parts[k].norm * IB_WEIGHTS[k];
+      score += parts[k].norm * IB_WEIGHTS[k];
       breakdown[k] = round2(parts[k].norm * IB_WEIGHTS[k]);
       if (parts[k].present) presentWeight += IB_WEIGHTS[k];
     }
-    const clamped = Math.max(0, Math.min(100, score2));
+    const clamped = Math.max(0, Math.min(100, score));
     const coverage = presentWeight / 100;
     const confidence = coverage >= 0.7 ? "HIGH" : coverage >= 0.4 ? "MEDIUM" : "LOW";
     const signals = IB_ORDER.flatMap((k) => parts[k].signal ? [parts[k].signal] : []);
@@ -296,7 +314,7 @@
   // src/shared/sourcing.ts
   var BOOST_WEIGHT = { small: 1, medium: 2, large: 3 };
   var norm = (v) => String(v ?? "").trim().toLowerCase();
-  var num = (v) => typeof v === "number" ? v : Number(String(v ?? "").replace(",", "."));
+  var num2 = (v) => typeof v === "number" ? v : num(v) ?? NaN;
   function matchValue(actual, op, value) {
     switch (op) {
       case "known":
@@ -308,14 +326,14 @@
       case "is_not":
         return norm(actual) !== norm(value);
       case "gte":
-        return Number.isFinite(num(actual)) && num(actual) >= num(value);
+        return Number.isFinite(num2(actual)) && num2(actual) >= num2(value);
       case "lte":
-        return Number.isFinite(num(actual)) && num(actual) <= num(value);
+        return Number.isFinite(num2(actual)) && num2(actual) <= num2(value);
       case "within_days":
-        return Number.isFinite(num(actual)) && num(actual) <= num(value);
+        return Number.isFinite(num2(actual)) && num2(actual) <= num2(value);
       case "between": {
         const [lo, hi] = value ?? [NaN, NaN];
-        const a = num(actual);
+        const a = num2(actual);
         return Number.isFinite(a) && a >= lo && a <= hi;
       }
       case "one_of":
@@ -369,9 +387,9 @@
   }
   function dealHealthScore(signals) {
     const penalty = signals.reduce((s, x) => s + (x.severity === "risk" ? 30 : x.severity === "watch" ? 10 : 0), 0);
-    const score2 = Math.max(0, 100 - penalty);
+    const score = Math.max(0, 100 - penalty);
     const worst = signals.some((x) => x.severity === "risk") ? "risk" : signals.some((x) => x.severity === "watch") ? "watch" : "ok";
-    return { score: score2, worst };
+    return { score, worst };
   }
 
   // src/tools/playground.ts
@@ -386,31 +404,19 @@
     if (el) el.textContent = JSON.stringify(data, null, 2);
   };
   function runScore() {
-    const count = Number(valOf("pi_count") || "0");
-    const freshest = numOrNull("pi_days");
-    const products = ["sales", "service", "marketing", "crm"];
-    const reachable = valOf("reachable");
     const input = {
-      ptScore: numOrNull("ptScore"),
-      mhit: numOrNull("mhit"),
-      productIntents: Array.from({ length: count }, (_, i) => ({ product: products[i % 4], hasIntent: true, daysSinceSignal: freshest })),
-      mrAccountIntent: numOrNull("mr"),
-      threeMonthIntent: numOrNull("tm"),
-      pageViews: numOrNull("pv"),
-      fundingDaysAgo: numOrNull("fundingDays"),
-      fundingStage: valOf("fundingStage") || null,
-      jobChange: null,
-      jobChangeTitle: valOf("hireTitle") || null,
-      jobChangeDaysAgo: numOrNull("hireDays"),
-      headcountDeltaPct: numOrNull("headcount"),
+      name: valOf("name") || null,
+      domain: valOf("domain") || null,
+      fitScore: numOrNull("fitScore"),
+      predictedMrr: numOrNull("predictedMrr"),
       employeeCount: numOrNull("emp"),
+      annualRevenue: parseRevenue(valOf("revenue")),
       industry: valOf("industry") || null,
-      country: valOf("country") || null,
-      currentCrm: valOf("crm") || null,
-      engagement: valOf("engagement") || null,
-      reachableBuyer: reachable === "no" ? false : reachable === "yes" ? true : null,
-      ownedByOther: valOf("owned") === "yes" ? true : null,
-      entrenchedSalesforce: valOf("sfdc") === "yes" ? true : null
+      industryAlt: valOf("industryAlt") || null,
+      reasonsText: valOf("reasons") || null,
+      newHire: valOf("newHire") === "yes" ? true : null,
+      territory: valOf("territory") || null,
+      owner: valOf("owner") || null
     };
     show("scoreOut", scoreAccount(input));
   }
