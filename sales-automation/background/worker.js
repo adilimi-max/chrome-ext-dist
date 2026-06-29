@@ -1570,6 +1570,14 @@
     chrome.alarms.create(ALARM, { periodInMinutes: 1 });
     return state;
   }
+  async function resumeSweep(storage2) {
+    const cur = await storage2.getOr("sweepState", null);
+    if (!cur) return startSweep(storage2);
+    const next = { ...cur, active: true, done: false };
+    await storage2.set("sweepState", next);
+    chrome.alarms.create(ALARM, { periodInMinutes: 1 });
+    return next;
+  }
   async function stopSweep(storage2) {
     await chrome.alarms.clear(ALARM);
     const cur = await storage2.getOr("sweepState", null);
@@ -2392,6 +2400,10 @@
     }
     if (msg?.type === "START_SWEEP") {
       void startSweep(storage).then(sendResponse).catch((e) => sendResponse({ error: String(e?.message ?? e) }));
+      return true;
+    }
+    if (msg?.type === "RESUME_SWEEP") {
+      void resumeSweep(storage).then(sendResponse).catch((e) => sendResponse({ error: String(e?.message ?? e) }));
       return true;
     }
     if (msg?.type === "STOP_SWEEP") {

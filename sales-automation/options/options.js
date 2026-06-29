@@ -189,6 +189,10 @@ ${lines.join("\n") || "(no WARM+ fits yet \u2014 keep it running)"}
       diag('Sweep starting\u2026 open your HubSpot open-pool list + a logged-in claude.ai tab (web search ON), then walk away. It checkpoints as it goes \u2014 click "Sweep status / results" anytime to watch progress + see good-fit accounts.');
       void sendToWorker("START_SWEEP").then(() => sendToWorker("SWEEP_STATUS")).then(renderSweep);
     });
+    sel("sweepresume")?.addEventListener("click", () => {
+      diag("Resuming \u2014 continues from where it left off, skipping everything already scanned. Make sure your HubSpot list + a claude.ai tab (web search ON) are open.");
+      void sendToWorker("RESUME_SWEEP").then(() => sendToWorker("SWEEP_STATUS")).then(renderSweep);
+    });
     sel("sweepstatus")?.addEventListener("click", () => {
       void sendToWorker("SWEEP_STATUS").then(renderSweep);
     });
