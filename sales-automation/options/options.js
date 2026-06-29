@@ -128,11 +128,20 @@
       diag(s);
       return;
     }
-    const phase = s.done ? "DONE" : s.active ? "RUNNING" : "STOPPED";
+    const phase = s.halted ? "HALTED" : s.done ? "DONE" : s.active ? "RUNNING" : "STOPPED";
     const results = (s.results ?? []).slice().sort((a, b) => b.score - a.score);
     const research = `research: ${s.researchableSeen ?? 0} worth it \xB7 batches ok ${s.batchesOk ?? 0} / failed ${s.batchesFailed ?? 0}${s.lastFailure ? ` (last: ${s.lastFailure})` : ""} \xB7 ${s.researchedCount ?? 0} enriched`;
     const coverage = `coverage: last scrape ${s.lastScrapeRows ?? 0} rows \xB7 max ${s.maxScrapeRows ?? 0} \xB7 pages advanced ${s.pagesAdvanced ?? 0}`;
-    const head = `Sweep ${phase} \u2014 page ${(s.page ?? 0) + 1} \xB7 considered ${s.consideredCount ?? 0} \xB7 good-fit (WARM+) ${results.length}
+    const hsPage = s.hubspotPage ?? null;
+    const total = s.hubspotTotal ?? null;
+    const size = s.expectedPageSize ?? null;
+    const ofPages = total != null && size ? ` of ~${Math.ceil(total / size)}` : "";
+    const cap = size ? `${s.lastScrapeRows ?? 0}/${size}` : `${s.lastScrapeRows ?? 0}`;
+    const ground = `ground-truth: HubSpot page ${hsPage ?? "?"}${ofPages}${total != null ? ` \xB7 ${total} total` : ""} \xB7 mode=${s.harvestMode ?? "?"} \xB7 coverage ${cap}${s.coverageStalls ? ` \xB7 stalls ${s.coverageStalls}` : ""}`;
+    const halt = s.halted ? `
+*** HALTED: ${s.haltReason ?? "unknown"} \u2014 sweep stopped on a reconciliation/coverage failure rather than silently skipping. Click "Inspect list" + share the report, re-align the page, then Resume. ***` : "";
+    const head = `Sweep ${phase} \u2014 sweep page ${(s.page ?? 0) + 1} \xB7 considered ${s.consideredCount ?? 0} \xB7 good-fit (WARM+) ${results.length}${halt}
+${ground}
 ${research}
 ${coverage}`;
     const lines = results.slice(0, 50).map((r, i) => `${String(i + 1).padStart(2)}. [${r.tier}] ${r.score}  ${r.name}${r.researched ? " *" : ""}
@@ -183,13 +192,17 @@ ${lines.join("\n") || "(no WARM+ fits yet \u2014 keep it running)"}
       diag("Reading your HubSpot list view\u2026 (open your open-pool index table in a tab first)");
       void sendToWorker("TEST_HUBSPOT").then((r) => diag(r ?? { error: "no response from worker" }));
     });
+    sel("inspectlist")?.addEventListener("click", () => {
+      diag('Inspecting your HubSpot list view structure\u2026 (open your open-pool list in a tab first). This does ONE reversed probe-scroll to detect whether scrolling paginates, parses the "X\u2013Y of Z" pager, and classifies the harvest mode \u2014 structural only, safe to share.');
+      void sendToWorker("INSPECT_LIST").then((r) => diag(r ?? { error: "no response from worker" }));
+    });
     sel("sourcepreview")?.addEventListener("click", () => {
       diag("Scoring your live open pool\u2026 (open your open-pool list view in a tab first; OBSERVE \u2014 nothing is claimed)");
       void sendToWorker("SOURCE_PREVIEW").then((r) => diag(r ?? { error: "no response from worker" }));
     });
     sel("sweepstart")?.addEventListener("click", () => {
-      diag('Sweep starting\u2026 open your HubSpot open-pool list + a logged-in claude.ai tab (web search ON), then walk away. It checkpoints as it goes \u2014 click "Sweep status / results" anytime to watch progress + see good-fit accounts.');
-      void sendToWorker("START_SWEEP").then(() => sendToWorker("SWEEP_STATUS")).then(renderSweep);
+      diag('Fresh sweep \u2014 wipes prior progress + results and starts from the top. (Use "Resume sweep" to continue instead.) Open your HubSpot open-pool list + a logged-in claude.ai tab (web search ON), then walk away. It checkpoints as it goes \u2014 click "Sweep status / results" anytime.');
+      void sendToWorker("RESTART_SWEEP").then(() => sendToWorker("SWEEP_STATUS")).then(renderSweep);
     });
     sel("sweepresume")?.addEventListener("click", () => {
       diag("Resuming \u2014 continues from where it left off, skipping everything already scanned. Make sure your HubSpot list + a claude.ai tab (web search ON) are open.");

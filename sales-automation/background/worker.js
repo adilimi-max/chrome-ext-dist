@@ -267,7 +267,7 @@
       await transport.send(slotId, c.render(nonce));
       let raw;
       try {
-        raw = await transport.read(slotId, nonce);
+        raw = await transport.read(slotId, nonce, c.readDeadlineMs);
       } catch {
         return { ok: false, failure: "timeout", nonce };
       }
@@ -457,10 +457,10 @@
         args: [SEL, prompt]
       });
     }
-    async function read(slotId, nonce) {
+    async function read(slotId, nonce, deadlineMs) {
       const tabId = Number(slotId.split("@")[1]);
       const end = `\xA7\xA7END ${nonce}\xA7\xA7`;
-      const deadline = Date.now() + 9e4;
+      const deadline = Date.now() + (deadlineMs ?? 12e4);
       while (Date.now() < deadline) {
         const [res] = await chrome.scripting.executeScript({
           target: { tabId },
@@ -755,6 +755,471 @@
     return r;
   }
 
+  // src/shared/list-nav.ts
+  var RESEARCH_BATCH_CEIL = 4;
+  var RESEARCH_BATCH_FLOOR = 1;
+  var DEFAULT_PAGE_SIZE = 100;
+  var COVERAGE_FLOOR = 0.9;
+  var DIVERGENCE_TOLERANCE = 0;
+  var MAX_COVERAGE_STALLS = 2;
+  function toInt(s) {
+    if (s == null) return null;
+    const cleaned = s.replace(/[^\d]/g, "");
+    if (cleaned === "") return null;
+    const n = Number(cleaned);
+    return Number.isFinite(n) ? n : null;
+  }
+  var RANGE_RE = /\b([\d.,   ]+?)\s*[-–—]\s*([\d.,   ]+?)\s+of\s+([\d.,   ]+)/i;
+  var PAGE_RE = /page\s+(\d+)/i;
+  function parsePageState(pagerTexts, pageInputValue) {
+    let rangeStart = null;
+    let rangeEnd = null;
+    let total = null;
+    let raw = "";
+    let pageFromText = null;
+    for (const t of pagerTexts) {
+      if (rangeStart == null) {
+        const m = t.match(RANGE_RE);
+        if (m) {
+          const a = toInt(m[1]);
+          const b = toInt(m[2]);
+          const z = toInt(m[3]);
+          if (a != null && b != null && z != null && a <= b && b <= z) {
+            rangeStart = a;
+            rangeEnd = b;
+            total = z;
+            raw = t.trim();
+          }
+        }
+      }
+      if (pageFromText == null) {
+        const pm = t.match(PAGE_RE);
+        if (pm) pageFromText = toInt(pm[1]);
+      }
+    }
+    let pageSize = null;
+    if (rangeStart != null && rangeEnd != null) {
+      pageSize = rangeEnd - rangeStart + 1;
+      if (pageSize <= 0) pageSize = null;
+    }
+    let page = null;
+    let source = "none";
+    let confident = false;
+    if (rangeStart != null && pageSize != null) {
+      source = "range";
+      confident = true;
+      page = Math.floor((rangeStart - 1) / pageSize) + 1;
+      if (pageFromText != null) page = pageFromText;
+    } else if (pageFromText != null) {
+      page = pageFromText;
+      source = "range";
+      confident = false;
+    }
+    if (page == null) {
+      const pv = toInt(pageInputValue ?? null);
+      if (pv != null) {
+        page = pv;
+        source = "page-input";
+        confident = false;
+      }
+    }
+    return { page, rangeStart, rangeEnd, total, pageSize, raw, source, confident };
+  }
+  function classifyHarvestMode(p) {
+    const scrolled = p.scrollTopAfter > p.scrollTopBefore + 2;
+    const pagerOrUrlMoved = p.pagerAfter !== p.pagerBefore || p.urlAfter !== p.urlBefore;
+    const replaced = p.firstIdAfter !== "" && p.firstIdBefore !== "" && p.firstIdAfter !== p.firstIdBefore && !p.oldFirstIdStillPresent;
+    const grew = p.idCountAfter > p.idCountBefore && p.oldFirstIdStillPresent;
+    const enough = p.expected != null && p.idCountBefore >= p.expected;
+    if (pagerOrUrlMoved || replaced) return "scroll-paginates";
+    if (grew) return "virtualize";
+    if (!scrolled && enough) return "all-rendered";
+    if (!scrolled && p.pagerControlsPresent) return "classic-paginated";
+    return "unknown";
+  }
+  function coverageDecision(a) {
+    const { captured, expected, atBottom } = a;
+    const atFinalPartial = atBottom && a.rangeEnd != null && a.total != null && a.rangeEnd === a.total;
+    if (atFinalPartial) {
+      return { covered: true, captured, expected, underCovered: false, reason: "final partial page (rangeEnd===total)" };
+    }
+    if (expected == null) {
+      return {
+        covered: false,
+        captured,
+        expected,
+        underCovered: captured === 0,
+        reason: "expected unknown \u2014 cannot prove coverage"
+      };
+    }
+    if (captured >= expected) {
+      return { covered: true, captured, expected, underCovered: false, reason: "captured >= expected" };
+    }
+    if (atBottom) {
+      return { covered: true, captured, expected, underCovered: false, reason: "stable at bottom, short of expected" };
+    }
+    const under = captured < COVERAGE_FLOOR * expected;
+    return {
+      covered: !under,
+      captured,
+      expected,
+      underCovered: under,
+      reason: under ? `under-covered (${captured}/${expected} < ${COVERAGE_FLOOR})` : "near-covered"
+    };
+  }
+  function reconcilePage(sweepPage, observed) {
+    if (!observed.confident || observed.page == null) {
+      return { ok: false, diverged: false, expectedPage: sweepPage, observedPage: observed.page, reason: "pager not confident" };
+    }
+    const diff = Math.abs(sweepPage - observed.page);
+    const diverged = diff > DIVERGENCE_TOLERANCE;
+    return {
+      ok: !diverged,
+      diverged,
+      expectedPage: sweepPage,
+      observedPage: observed.page,
+      reason: diverged ? `sweep page ${sweepPage} vs HubSpot page ${observed.page}` : "aligned"
+    };
+  }
+  function advanceVerdict(before, after, pageSize) {
+    if (before.rangeEnd != null && before.total != null && before.rangeEnd === before.total) {
+      return { kind: "last-page" };
+    }
+    if (before.rangeStart == null || after.rangeStart == null) {
+      return { kind: "no-move" };
+    }
+    const moved = after.rangeStart - before.rangeStart;
+    if (moved <= 0) return { kind: "no-move" };
+    const size = pageSize ?? before.pageSize ?? after.pageSize ?? DEFAULT_PAGE_SIZE;
+    if (moved === size) return { kind: "advanced", newRangeStart: after.rangeStart };
+    return { kind: "skipped", jumpedBy: moved };
+  }
+  function isLastPage(p) {
+    return p.rangeEnd != null && p.total != null && p.rangeEnd === p.total;
+  }
+  function chooseBatchSize(o) {
+    const floor = o.floor ?? RESEARCH_BATCH_FLOOR;
+    const ceil = o.ceil ?? RESEARCH_BATCH_CEIL;
+    let size = o.current != null && o.current > 0 ? Math.min(o.current, ceil) : ceil;
+    if (o.lastFailure === "timeout") size = Math.max(floor, Math.floor(size / 2));
+    size = Math.max(floor, Math.min(size, ceil));
+    return Math.max(0, Math.min(size, o.remaining));
+  }
+  function nextSweepAction(a) {
+    const { pageState, mode, coverage, reconcile, researchRemaining } = a;
+    const stalls = a.state.coverageStalls ?? 0;
+    if (reconcile.diverged) return { kind: "halt", reason: "page-divergence" };
+    if (!pageState.confident && mode !== "all-rendered") {
+      return { kind: "halt", reason: "unparseable-pager" };
+    }
+    if (coverage.underCovered && stalls >= MAX_COVERAGE_STALLS) {
+      const reason = mode === "scroll-paginates" ? "uncoverable-scroll-paginates" : "uncoverable-page";
+      return { kind: "halt", reason };
+    }
+    if (coverage.underCovered) return { kind: "harvest", allowScroll: mode === "virtualize" };
+    if (pageState.total === 0) return { kind: "finish", reason: "empty-pool" };
+    if (researchRemaining > 0) return { kind: "research" };
+    if (isLastPage(pageState)) return { kind: "finish", reason: "last-page" };
+    return { kind: "advance" };
+  }
+
+  // src/background/hubspot-harvest.ts
+  async function readListState(tabId) {
+    const [res] = await chrome.scripting.executeScript({
+      target: { tabId },
+      func: () => {
+        const idFrom = (r) => {
+          for (const a of r.querySelectorAll("a[href]")) {
+            const href = a.getAttribute("href") ?? "";
+            const m = href.match(/record\/0-2\/(\d+)/) ?? href.match(/company\/(\d+)/) ?? href.match(/0-2\/(\d+)/);
+            if (m) return m[1];
+          }
+          return "";
+        };
+        const tableSels = ['[data-test-id="table"]', '[role="grid"]', '[role="table"]', "table"];
+        let table = document;
+        for (const s of tableSels) {
+          const el = document.querySelector(s);
+          if (el) {
+            table = el;
+            break;
+          }
+        }
+        const CELL = 'td, [role="cell"], [role="gridcell"]';
+        const currentRows = () => {
+          for (const s of ["tbody tr", '[role="row"]', "tr"]) {
+            const els = [...table.querySelectorAll(s)].filter((r) => r.querySelector(CELL));
+            if (els.length) return els;
+          }
+          return [];
+        };
+        const findScroller = (start) => {
+          let n = start;
+          while (n && n !== document.body && n !== document.documentElement) {
+            const st = getComputedStyle(n);
+            if ((st.overflowY === "auto" || st.overflowY === "scroll") && n.scrollHeight > n.clientHeight + 40) return n;
+            n = n.parentElement;
+          }
+          return null;
+        };
+        const rows = currentRows();
+        const ids = rows.map(idFrom);
+        const pagerTexts = [];
+        const pagerSel = '[data-test-id*="pagination"], [class*="pagination" i], [aria-label*="pagination" i], nav[role="navigation"], [class*="pager" i]';
+        for (const el of document.querySelectorAll(pagerSel)) {
+          const t = (el.textContent ?? "").replace(/\s+/g, " ").trim();
+          if (t && t.length <= 120) pagerTexts.push(t);
+        }
+        for (const el of document.querySelectorAll("span, div, p")) {
+          if (el.children.length > 0) continue;
+          const t = (el.textContent ?? "").replace(/\s+/g, " ").trim();
+          if (t.length > 0 && t.length <= 60 && (/\bof\b/i.test(t) || /page\s+\d/i.test(t)) && /\d/.test(t)) {
+            pagerTexts.push(t);
+          }
+        }
+        const pageInput = document.querySelector(
+          'input[aria-label*="page" i], input[name*="page" i], input[type="number"]'
+        );
+        const scroller = findScroller(table instanceof Element ? table : document.body);
+        return {
+          onHubspot: true,
+          url: location.href.split("?")[0],
+          pagerTexts: [...new Set(pagerTexts)].slice(0, 12),
+          pageInputValue: pageInput ? pageInput.value : null,
+          renderedRowIds: ids,
+          renderedRowCount: rows.length,
+          scrollerFound: scroller != null
+        };
+      }
+    });
+    return res?.result ?? {
+      onHubspot: false,
+      url: "",
+      pagerTexts: [],
+      pageInputValue: null,
+      renderedRowIds: [],
+      renderedRowCount: 0,
+      scrollerFound: false
+    };
+  }
+  async function scrollProbe(tabId, expected) {
+    const [res] = await chrome.scripting.executeScript({
+      target: { tabId },
+      func: async (expectedArg) => {
+        const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+        const idFrom = (r) => {
+          for (const a of r.querySelectorAll("a[href]")) {
+            const href = a.getAttribute("href") ?? "";
+            const m = href.match(/record\/0-2\/(\d+)/) ?? href.match(/company\/(\d+)/) ?? href.match(/0-2\/(\d+)/);
+            if (m) return m[1];
+          }
+          return "";
+        };
+        const tableSels = ['[data-test-id="table"]', '[role="grid"]', '[role="table"]', "table"];
+        let table = document;
+        for (const s of tableSels) {
+          const el = document.querySelector(s);
+          if (el) {
+            table = el;
+            break;
+          }
+        }
+        const CELL = 'td, [role="cell"], [role="gridcell"]';
+        const ids = () => {
+          for (const s of ["tbody tr", '[role="row"]', "tr"]) {
+            const els = [...table.querySelectorAll(s)].filter((r) => r.querySelector(CELL));
+            if (els.length) return els.map(idFrom);
+          }
+          return [];
+        };
+        const pagerText = () => {
+          const out = [];
+          for (const el of document.querySelectorAll("span, div, p")) {
+            if (el.children.length > 0) continue;
+            const t = (el.textContent ?? "").replace(/\s+/g, " ").trim();
+            if (t.length > 0 && t.length <= 60 && (/\bof\b/i.test(t) || /page\s+\d/i.test(t)) && /\d/.test(t)) out.push(t);
+          }
+          return out.join(" | ");
+        };
+        const pagerControlsPresent = () => {
+          const btns = [...document.querySelectorAll('button, a[role="button"]')];
+          return btns.some((b) => /next|previous|prev|page/i.test((b.getAttribute("aria-label") ?? "") + " " + (b.textContent ?? "")));
+        };
+        const findScroller = (start) => {
+          let n = start;
+          while (n && n !== document.body && n !== document.documentElement) {
+            const st = getComputedStyle(n);
+            if ((st.overflowY === "auto" || st.overflowY === "scroll") && n.scrollHeight > n.clientHeight + 40) return n;
+            n = n.parentElement;
+          }
+          return document.scrollingElement ?? document.documentElement;
+        };
+        const scroller = findScroller(table instanceof Element ? table : document.body);
+        const idsBefore = ids();
+        const firstIdBefore = idsBefore[0] ?? "";
+        const pagerBefore = pagerText();
+        const urlBefore = location.href.split("?")[0];
+        const scrollTopBefore = scroller.scrollTop;
+        scroller.scrollBy(0, 400);
+        await sleep(600);
+        const idsAfter = ids();
+        const firstIdAfter = idsAfter[0] ?? "";
+        const oldFirstIdStillPresent = firstIdBefore !== "" && idsAfter.includes(firstIdBefore);
+        const pagerAfter = pagerText();
+        const urlAfter = location.href.split("?")[0];
+        const scrollTopAfter = scroller.scrollTop;
+        const delta = scrollTopAfter - scrollTopBefore;
+        if (delta !== 0) {
+          scroller.scrollBy(0, -delta);
+          await sleep(120);
+        }
+        return {
+          idCountBefore: idsBefore.length,
+          idCountAfter: idsAfter.length,
+          firstIdBefore,
+          firstIdAfter,
+          oldFirstIdStillPresent,
+          pagerBefore,
+          pagerAfter,
+          scrollTopBefore,
+          scrollTopAfter,
+          urlBefore,
+          urlAfter,
+          pagerControlsPresent: pagerControlsPresent(),
+          expected: expectedArg
+        };
+      },
+      args: [expected]
+    });
+    return res?.result ?? {
+      idCountBefore: 0,
+      idCountAfter: 0,
+      firstIdBefore: "",
+      firstIdAfter: "",
+      oldFirstIdStillPresent: false,
+      pagerBefore: "",
+      pagerAfter: "",
+      scrollTopBefore: 0,
+      scrollTopAfter: 0,
+      urlBefore: "",
+      urlAfter: "",
+      pagerControlsPresent: false,
+      expected
+    };
+  }
+
+  // src/background/list-probe.ts
+  async function findHubspotTab2() {
+    const tabs = await chrome.tabs.query({ url: ["*://*.hubspot.com/*"] });
+    if (tabs.length === 0) return null;
+    return tabs.sort((a, b) => (b.lastAccessed ?? 0) - (a.lastAccessed ?? 0))[0];
+  }
+  async function readPagerControls(tabId) {
+    const [res] = await chrome.scripting.executeScript({
+      target: { tabId },
+      func: () => {
+        const btns = [...document.querySelectorAll('button, a[role="button"]')];
+        const controls = btns.filter((b) => /next|previous|prev|page|pagination/i.test((b.getAttribute("aria-label") ?? "") + " " + (b.textContent ?? ""))).slice(0, 12).map((b) => ({
+          tag: b.tagName.toLowerCase(),
+          ariaLabel: b.getAttribute("aria-label"),
+          testid: b.getAttribute("data-test-id") ?? b.getAttribute("data-testid"),
+          text: (b.textContent ?? "").replace(/\s+/g, " ").trim().slice(0, 24),
+          disabled: b.disabled || b.getAttribute("aria-disabled") === "true"
+        }));
+        const tableSels = ['[data-test-id="table"]', '[role="grid"]', '[role="table"]', "table"];
+        let table = null;
+        for (const s of tableSels) {
+          const el = document.querySelector(s);
+          if (el) {
+            table = el;
+            break;
+          }
+        }
+        const findScroller = (start) => {
+          let n = start;
+          while (n && n !== document.body && n !== document.documentElement) {
+            const st = getComputedStyle(n);
+            if ((st.overflowY === "auto" || st.overflowY === "scroll") && n.scrollHeight > n.clientHeight + 40) return n;
+            n = n.parentElement;
+          }
+          return document.scrollingElement ?? null;
+        };
+        const sc = findScroller(table);
+        return {
+          controls,
+          scroller: {
+            found: sc != null,
+            scrollHeight: sc?.scrollHeight ?? 0,
+            clientHeight: sc?.clientHeight ?? 0,
+            scrollTop: sc?.scrollTop ?? 0
+          }
+        };
+      }
+    });
+    return res?.result ?? {
+      controls: [],
+      scroller: { found: false, scrollHeight: 0, clientHeight: 0, scrollTop: 0 }
+    };
+  }
+  async function inspectList() {
+    const empty2 = {
+      onHubspot: false,
+      url: "",
+      scroller: { found: false, scrollHeight: 0, clientHeight: 0, scrollTop: 0 },
+      testScroll: {
+        deltaScrollTop: 0,
+        deltaRowIdCount: 0,
+        firstIdChanged: false,
+        oldFirstIdStillPresent: false,
+        pagerChanged: false,
+        urlChanged: false,
+        restoredScroll: false
+      },
+      classifiedMode: "unknown",
+      pageState: parsePageState([]),
+      pagerControls: [],
+      pageStateTextSamples: [],
+      renderedRowCount: 0,
+      expectedPageSize: null,
+      allRowsPresentWithoutScroll: false,
+      note: "No HubSpot tab found. Open your open-pool LIST VIEW (the company index table), let it load, then retry."
+    };
+    const tab = await findHubspotTab2();
+    if (!tab?.id) return empty2;
+    const list = await readListState(tab.id);
+    if (!list.onHubspot) return { ...empty2, onHubspot: false, url: list.url };
+    const pageState = parsePageState(list.pagerTexts, list.pageInputValue);
+    const expectedPageSize = pageState.pageSize ?? null;
+    const probe = await scrollProbe(tab.id, expectedPageSize);
+    const mode = classifyHarvestMode(probe);
+    const { controls, scroller } = await readPagerControls(tab.id);
+    const allRowsPresentWithoutScroll = expectedPageSize != null ? list.renderedRowCount >= expectedPageSize : false;
+    const verdict = mode === "scroll-paginates" ? "DANGER: scrolling this list ADVANCES HubSpot pages (paginate-on-scroll) \u2014 the sweep must NOT scroll-harvest; it reads the rendered page and paginates by the Next control only." : mode === "virtualize" ? "OK: the list virtualizes in place \u2014 scrolling loads more rows of the SAME page (safe to scroll-harvest)." : mode === "all-rendered" ? "OK: the full page is already rendered without scrolling." : mode === "classic-paginated" ? "OK: classic pagination \u2014 the rendered rows ARE the page; advance via the Next control." : "UNKNOWN: ambiguous scroll behavior \u2014 the sweep treats this as no-scroll and surfaces this report.";
+    return {
+      onHubspot: true,
+      url: list.url,
+      scroller,
+      testScroll: {
+        deltaScrollTop: probe.scrollTopAfter - probe.scrollTopBefore,
+        deltaRowIdCount: probe.idCountAfter - probe.idCountBefore,
+        firstIdChanged: probe.firstIdBefore !== "" && probe.firstIdAfter !== probe.firstIdBefore,
+        oldFirstIdStillPresent: probe.oldFirstIdStillPresent,
+        pagerChanged: probe.pagerAfter !== probe.pagerBefore,
+        urlChanged: probe.urlAfter !== probe.urlBefore,
+        restoredScroll: Math.abs(probe.scrollTopAfter - probe.scrollTopBefore) >= 0
+        // probe always reverses; reported for transparency
+      },
+      classifiedMode: mode,
+      pageState,
+      pagerControls: controls,
+      pageStateTextSamples: list.pagerTexts,
+      renderedRowCount: list.renderedRowCount,
+      expectedPageSize,
+      allRowsPresentWithoutScroll,
+      note: `${verdict} Share this report \u2014 it names the exact mode, pager structure, and the parser's read of the page range. (Structural only: no customer data.)`
+    };
+  }
+
   // src/shared/scoring-signals.ts
   function piecewise(x, pts) {
     if (x <= pts[0][0]) return pts[0][1];
@@ -838,7 +1303,7 @@
     return "SKIP";
   }
   var RESEARCHED_FIT_HAIRCUT = 0.85;
-  var COVERAGE_FLOOR = 0.3;
+  var COVERAGE_FLOOR2 = 0.3;
   var round = (n, dp = 1) => {
     const f = 10 ** dp;
     return Math.round(n * f) / f;
@@ -874,7 +1339,7 @@
       lacksValueEvidence: !valuePresent,
       // A lone weak dimension (coverage below the floor — e.g. only industryFit/sizeFit present) is too
       // thin to justify more than NURTURE, even though re-normalization inflates its score.
-      thinEvidence: coverage > 0 && coverage < COVERAGE_FLOOR,
+      thinEvidence: coverage > 0 && coverage < COVERAGE_FLOOR2,
       // Gated on enforceViewFilters (DEFAULT OFF): the view already filters Nordic+open, and re-deriving
       // these from scraped DOM text is unreliable. Off => never cap on territory/owner (trust the view).
       territoryMismatch: cfg.enforceViewFilters && terr !== "" && !allowed.has(terr),
@@ -1132,16 +1597,115 @@
     return age >= 0 && age < maxAgeDays * DAY_MS;
   }
 
-  // src/background/hubspot-scrape.ts
-  async function findHubspotTab2() {
-    const tabs = await chrome.tabs.query({ url: ["*://*.hubspot.com/*"] });
-    if (tabs.length === 0) return null;
-    return tabs.sort((a, b) => (b.lastAccessed ?? 0) - (a.lastAccessed ?? 0))[0];
+  // src/shared/sweep-guards.ts
+  var ADVANCE_OVERLAP_CEIL = 0.5;
+  var POOL_DRIFT_TOLERANCE = 0.02;
+  function confirmAdvance(a) {
+    if (a.expectedPage != null && a.observedPage != null && a.observedPage !== a.expectedPage) {
+      return { ok: false, reason: "advance-page-mismatch" };
+    }
+    if (a.newRowIds > 0 && a.overlapWithProcessed > ADVANCE_OVERLAP_CEIL * a.newRowIds) {
+      return { ok: false, reason: "advance-overlap" };
+    }
+    return { ok: true };
   }
-  async function scrapeRows(tabId) {
+  function poolChanged(baseline, observed) {
+    if (baseline == null || baseline <= 0 || observed == null) return false;
+    return Math.abs(observed - baseline) > POOL_DRIFT_TOLERANCE * baseline;
+  }
+  function pageResorted(recordedFirstId, currentFirstId) {
+    const a = (recordedFirstId ?? "").trim();
+    const b = (currentFirstId ?? "").trim();
+    if (a === "" || b === "") return false;
+    return a !== b;
+  }
+  function expectedCoverageSize(observed, learned, total) {
+    const o = observed != null && observed > 0 ? observed : null;
+    const l = learned != null && learned > 0 ? learned : null;
+    let size = o == null ? l : l == null ? o : Math.max(o, l);
+    if (size == null) return null;
+    if (total != null && total > 0 && total < size) size = total;
+    return size;
+  }
+
+  // src/background/hubspot-harvest-rows.ts
+  async function readRenderedRows(tabId) {
     const [res] = await chrome.scripting.executeScript({
       target: { tabId },
-      func: async () => {
+      func: () => {
+        const tableSels = ['[data-test-id="table"]', '[role="grid"]', '[role="table"]', "table"];
+        let table = document;
+        for (const s of tableSels) {
+          const el = document.querySelector(s);
+          if (el) {
+            table = el;
+            break;
+          }
+        }
+        const headerSels = ['[data-test-id*="column-header"]', '[role="columnheader"]', "thead th", "th"];
+        let headerEls = [];
+        for (const s of headerSels) {
+          const els = [...table.querySelectorAll(s)];
+          if (els.length) {
+            headerEls = els;
+            break;
+          }
+        }
+        const headers = headerEls.map((h) => (h.textContent ?? "").replace(/\s+/g, " ").trim());
+        const headerCount = headers.length;
+        const CELL = 'td, [role="cell"], [role="gridcell"]';
+        const currentRows = () => {
+          for (const s of ["tbody tr", '[role="row"]', "tr"]) {
+            const els = [...table.querySelectorAll(s)].filter((r) => r.querySelector(CELL));
+            if (els.length) return els;
+          }
+          return [];
+        };
+        const idFrom = (r) => {
+          for (const a of r.querySelectorAll("a[href]")) {
+            const href = a.getAttribute("href") ?? "";
+            const m = href.match(/record\/0-2\/(\d+)/) ?? href.match(/company\/(\d+)/) ?? href.match(/0-2\/(\d+)/);
+            if (m) return m[1];
+          }
+          return "";
+        };
+        const alignedCells = (r) => {
+          let cells = [...r.querySelectorAll(CELL)];
+          while (cells.length > 0) {
+            const c0 = cells[0];
+            if (c0.querySelector('input[type="checkbox"]') || /^select row$/i.test((c0.textContent ?? "").trim())) {
+              cells = cells.slice(1);
+              continue;
+            }
+            break;
+          }
+          if (cells.length > headerCount) cells = cells.slice(0, headerCount);
+          return cells;
+        };
+        const clean = (s) => {
+          const v = (s ?? "").replace(/\s+/g, " ").trim();
+          return v === "--" || v === "\u2014" || v === "-" ? "" : v;
+        };
+        const byKey = /* @__PURE__ */ new Map();
+        for (const r of currentRows()) {
+          const objectId = idFrom(r);
+          const row = {};
+          const cells = alignedCells(r);
+          headers.forEach((h, i) => {
+            if (h) row[h] = clean(cells[i]?.textContent ?? "");
+          });
+          const key = objectId || JSON.stringify(row);
+          if (!byKey.has(key)) byKey.set(key, { objectId, row });
+        }
+        return [...byKey.values()];
+      }
+    });
+    return res?.result ?? [];
+  }
+  async function virtualizeHarvest(tabId, expected) {
+    const [res] = await chrome.scripting.executeScript({
+      target: { tabId },
+      func: async (expectedArg) => {
         const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
         const tableSels = ['[data-test-id="table"]', '[role="grid"]', '[role="table"]', "table"];
         let table = document;
@@ -1204,6 +1768,30 @@
           });
           return row;
         };
+        const pagerText = () => {
+          const out = [];
+          for (const el of document.querySelectorAll("span, div, p")) {
+            if (el.children.length > 0) continue;
+            const t = (el.textContent ?? "").replace(/\s+/g, " ").trim();
+            if (t.length > 0 && t.length <= 60 && (/\bof\b/i.test(t) || /page\s+\d/i.test(t)) && /\d/.test(t)) out.push(t);
+          }
+          return out.join(" | ");
+        };
+        const rangeStartNow = () => {
+          for (const el of document.querySelectorAll("span, div, p, nav, footer")) {
+            const t = (el.textContent ?? "").replace(/\s+/g, " ").trim();
+            const m = t.match(/\b([\d.,\s]+?)\s*[-–—]\s*[\d.,\s]+?\s+of\s+[\d.,\s]+/i);
+            if (m) {
+              const n = Number(m[1].replace(/[^\d]/g, ""));
+              if (Number.isFinite(n)) return n;
+            }
+          }
+          return null;
+        };
+        const firstId = () => {
+          const rs = currentRows();
+          return rs.length ? idFrom(rs[0]) : "";
+        };
         const findScroller = (start) => {
           let n = start;
           while (n && n !== document.body && n !== document.documentElement) {
@@ -1224,25 +1812,75 @@
           }
         };
         harvest();
-        let stable = 0;
-        for (let i = 0; i < 80 && stable < 3; i++) {
+        const pagerStart = pagerText();
+        const urlStart = location.href.split("?")[0];
+        const rangeStartStart = rangeStartNow();
+        const firstIdStart = firstId();
+        const moved = () => pagerText() !== pagerStart || location.href.split("?")[0] !== urlStart || rangeStartStart != null && rangeStartNow() != null && rangeStartNow() !== rangeStartStart || firstIdStart !== "" && firstId() !== "" && firstId() !== firstIdStart;
+        let zeroDelta = 0;
+        const target = expectedArg ?? 100;
+        for (let i = 0; i < 60 && byKey.size < target && zeroDelta < 3; i++) {
+          if (moved()) break;
           const before = byKey.size;
           const prevTop = scroller.scrollTop;
           scroller.scrollBy(0, Math.max(240, scroller.clientHeight * 0.85));
           await sleep(420);
+          if (moved()) break;
           harvest();
           const atBottom = scroller.scrollTop <= prevTop + 2;
-          if (byKey.size === before && atBottom) stable += 1;
-          else stable = 0;
+          if (byKey.size === before && atBottom) zeroDelta += 1;
+          else zeroDelta = 0;
         }
         return [...byKey.values()];
-      }
+      },
+      args: [expected]
     });
     return res?.result ?? [];
   }
+
+  // src/background/hubspot-scrape.ts
+  async function findHubspotTab3() {
+    const tabs = await chrome.tabs.query({ url: ["*://*.hubspot.com/*"] });
+    if (tabs.length === 0) return null;
+    return tabs.sort((a, b) => (b.lastAccessed ?? 0) - (a.lastAccessed ?? 0))[0];
+  }
+  async function harvestCurrentPage(tabId, cachedMode, learnedPageSize) {
+    const list = await readListState(tabId);
+    const pager = parsePageState(list.pagerTexts, list.pageInputValue);
+    const expected = pager.pageSize ?? null;
+    const coverageExpected = expectedCoverageSize(expected, learnedPageSize, pager.total);
+    let mode;
+    let probe = null;
+    if (cachedMode != null) {
+      mode = cachedMode;
+    } else {
+      probe = await scrollProbe(tabId, expected);
+      mode = classifyHarvestMode(probe);
+    }
+    let rows;
+    if (mode === "virtualize") {
+      rows = await virtualizeHarvest(tabId, expected);
+    } else {
+      rows = await readRenderedRows(tabId);
+    }
+    const atBottom = list.scrollerFound && probe != null && probe.scrollTopAfter <= probe.scrollTopBefore + 2 && // the probe scroll didn't move (already at bottom)
+    mode !== "virtualize";
+    const coverage = coverageDecision({
+      captured: rows.length,
+      expected: coverageExpected,
+      atBottom,
+      mode,
+      rangeEnd: pager.rangeEnd,
+      total: pager.total
+    });
+    return { rows, pager, mode, coverage };
+  }
+  async function scrapeRows(tabId) {
+    return (await harvestCurrentPage(tabId)).rows;
+  }
   var domainKey = (d) => (d ?? "").trim().toLowerCase();
   async function previewSourcing(storage2, topN = 15) {
-    const tab = await findHubspotTab2();
+    const tab = await findHubspotTab3();
     if (!tab?.id) {
       return {
         onHubspot: false,
@@ -1304,7 +1942,7 @@
     };
   }
   async function researchThinAccounts(bridge2, storage2, cap = 8) {
-    const tab = await findHubspotTab2();
+    const tab = await findHubspotTab3();
     if (!tab?.id) {
       return {
         onHubspot: false,
@@ -1367,6 +2005,77 @@
       failed,
       remaining,
       note: `Researched ${researched} thin account(s)${failed ? `, ${failed} failed (bridge timeout / no web result)` : ""}. ${reused} already cached. ${remaining} still queued \u2014 run again to continue. Then click "Preview sourcing" to see the re-ranked list.`
+    };
+  }
+
+  // src/background/hubspot-pager.ts
+  async function clickPagerVerified(tabId, before) {
+    const [res] = await chrome.scripting.executeScript({
+      target: { tabId },
+      func: async (prev) => {
+        const sleep = (ms) => new Promise((r2) => setTimeout(r2, ms));
+        const firstId = () => {
+          const a = document.querySelector('a[href*="/record/0-2/"], a[href*="/company/"], a[href*="0-2/"]');
+          const href = a?.getAttribute("href") ?? "";
+          const m = href.match(/record\/0-2\/(\d+)/) ?? href.match(/company\/(\d+)/) ?? href.match(/0-2\/(\d+)/);
+          return m ? m[1] : "";
+        };
+        const pagerText = () => {
+          const out = [];
+          for (const el of document.querySelectorAll("span, div, p")) {
+            if (el.children.length > 0) continue;
+            const t = (el.textContent ?? "").replace(/\s+/g, " ").trim();
+            if (t.length > 0 && t.length <= 60 && (/\bof\b/i.test(t) || /page\s+\d/i.test(t)) && /\d/.test(t)) out.push(t);
+          }
+          return [...new Set(out)].slice(0, 12);
+        };
+        const rangeStartNow = () => {
+          for (const t of pagerText()) {
+            const m = t.match(/\b([\d.,   ]+?)\s*[-–—]\s*[\d.,   ]+?\s+of\s+/i);
+            if (m) {
+              const n = Number(m[1].replace(/[^\d]/g, ""));
+              if (Number.isFinite(n)) return n;
+            }
+          }
+          return null;
+        };
+        const pageInput = document.querySelector(
+          'input[aria-label*="page" i], input[name*="page" i], input[type="number"]'
+        );
+        const btns = [...document.querySelectorAll('button, a[role="button"]')];
+        const enabled = (b) => !b.disabled && b.getAttribute("aria-disabled") !== "true";
+        const next = btns.find((b) => /next( page)?/i.test(b.getAttribute("aria-label") ?? "") && enabled(b)) ?? btns.find((b) => /^next$/i.test((b.textContent ?? "").trim()) && enabled(b));
+        if (!next) {
+          return { newFirstId: firstId(), pagerTexts: pagerText(), pageInputValue: pageInput?.value ?? null, clicked: false, atEndBeforeClick: true };
+        }
+        next.click();
+        for (let i = 0; i < 20; i++) {
+          await sleep(400);
+          const id = firstId();
+          const rs = rangeStartNow();
+          const idMoved = id !== "" && id !== prev.firstId;
+          const rangeMoved = rs != null && prev.rangeStart != null && rs > prev.rangeStart;
+          if (rangeMoved || idMoved && prev.rangeStart == null) break;
+        }
+        return { newFirstId: firstId(), pagerTexts: pagerText(), pageInputValue: pageInput?.value ?? null, clicked: true, atEndBeforeClick: false };
+      },
+      args: [{ rangeStart: before.rangeStart, firstId: before.firstId }]
+    });
+    const r = res?.result;
+    if (!r) {
+      return { advanced: false, newRangeStart: null, newPage: before.page, newFirstId: before.firstId, skipped: false, pagerTexts: [], pageInputValue: null, clicked: false };
+    }
+    const after = parsePageState(r.pagerTexts, r.pageInputValue);
+    const advanced = after.rangeStart != null && before.rangeStart != null && after.rangeStart > before.rangeStart;
+    return {
+      advanced,
+      newRangeStart: after.rangeStart,
+      newPage: after.page,
+      newFirstId: r.newFirstId,
+      skipped: false,
+      pagerTexts: r.pagerTexts,
+      pageInputValue: r.pageInputValue,
+      clicked: r.clicked
     };
   }
 
@@ -1492,6 +2201,9 @@
       retryClass: "read",
       promptName: "research-companies",
       egressMode: "research-batch",
+      // A multi-company WEB SEARCH batch routinely exceeds the 120s default; give it 150s (orthogonal to
+      // egress/refs/checksum — smaller batches only strengthen the checksum).
+      readDeadlineMs: 15e4,
       // ONLY {name, domain} per item leaves the box — refs are non-PII indices and never ride the payload.
       egressPayload: items.map((i) => ({ name: i.name, domain: i.domain })),
       render: (nonce) => [
@@ -1555,16 +2267,71 @@
     return items;
   }
 
-  // src/background/sweep-engine.ts
-  var ALARM = "sweepTick";
-  var BATCH_SIZE = 8;
-  var BATCHES_PER_TICK = 3;
-  var dk = (d) => (d ?? "").trim().toLowerCase();
+  // src/background/sweep-research.ts
+  var RESEARCH_REMAINING_PROBE = 1e3;
   function toResult(o) {
     const why = [...o.signals, o.researchNote ? `why-now: ${o.researchNote}` : ""].filter(Boolean).join(" \xB7 ") || "no scored signals";
     return { objectId: o.objectId, name: o.name, domain: o.domain, tier: o.tier, score: o.score, why, researched: o.researched };
   }
-  async function startSweep(storage2) {
+  async function researchOneBatch(bridge2, storage2, state, researchable) {
+    const remaining = selectUnprocessed(researchable, new Set(state.processed), RESEARCH_REMAINING_PROBE).length;
+    const size = chooseBatchSize({ remaining, lastFailure: state.lastFailure, current: state.batchSize });
+    const batch = selectUnprocessed(researchable, new Set(state.processed), size);
+    if (batch.length === 0) return state;
+    const items = batch.map((x, i) => ({
+      ref: i + 1,
+      name: x.input.name ?? "",
+      domain: x.input.domain ?? "",
+      hints: { industry: x.input.industry ?? x.input.industryAlt, employees: x.input.employeeCount }
+    }));
+    const keys = batch.map((x) => sweepKey({ objectId: x.objectId, domain: x.domain }));
+    state = recordResults(state, [], "WARM", keys);
+    await storage2.set("sweepState", state);
+    const res = await bridge2.call(makeBatchResearchCall(items));
+    const scored = [];
+    if (res.ok && Array.isArray(res.value)) {
+      for (const it of res.value) {
+        const x = batch[it.ref - 1];
+        if (!x) continue;
+        const merged = mergeResearch(x.input, it.result).input;
+        const r = scoreAccount(merged);
+        scored.push(toResult({
+          objectId: x.objectId,
+          name: merged.name ?? "(no name)",
+          domain: merged.domain ?? x.domain,
+          tier: r.tier,
+          score: r.score,
+          signals: r.signals,
+          researchNote: merged.researchNote,
+          researched: true
+        }));
+        await storage2.update("dossier", (cur) => ({ ...cur ?? {}, [x.domain]: { domain: x.domain, researchedAt: Date.now(), result: it.result } }));
+      }
+    }
+    const returnedResearched = new Set(scored.filter((r) => r.researched && sweepKey(r) !== "").map((r) => sweepKey(r))).size;
+    let next = recordResults(state, scored, "WARM", []);
+    next = {
+      ...next,
+      researchedCount: next.researchedCount + returnedResearched,
+      batchSize: size,
+      batchesOk: (next.batchesOk ?? 0) + (res.ok ? 1 : 0),
+      batchesFailed: (next.batchesFailed ?? 0) + (res.ok ? 0 : 1),
+      lastFailure: res.ok ? next.lastFailure : res.failure ?? "unknown"
+    };
+    await storage2.set("sweepState", next);
+    return next;
+  }
+
+  // src/background/sweep-engine.ts
+  var ALARM = "sweepTick";
+  var TICK_LEASE_MS = 18e4;
+  var MAX_NO_MOVE_TICKS = 3;
+  var dk = (d) => (d ?? "").trim().toLowerCase();
+  async function startSweep(storage2, force = false) {
+    if (!force) {
+      const cur = await storage2.getOr("sweepState", null);
+      if (cur && !cur.done) return resumeSweep(storage2);
+    }
     const state = initSweepState(Date.now());
     await storage2.set("sweepState", state);
     chrome.alarms.create(ALARM, { periodInMinutes: 1 });
@@ -1572,8 +2339,8 @@
   }
   async function resumeSweep(storage2) {
     const cur = await storage2.getOr("sweepState", null);
-    if (!cur) return startSweep(storage2);
-    const next = { ...cur, active: true, done: false };
+    if (!cur) return startSweep(storage2, true);
+    const next = { ...cur, active: true, done: false, halted: false, haltReason: void 0, tickLeaseUntil: void 0 };
     await storage2.set("sweepState", next);
     chrome.alarms.create(ALARM, { periodInMinutes: 1 });
     return next;
@@ -1589,54 +2356,90 @@
   async function getSweep(storage2) {
     return storage2.getOr("sweepState", null);
   }
-  async function firstRowId(tabId) {
-    const [res] = await chrome.scripting.executeScript({
-      target: { tabId },
-      func: () => {
-        const a = document.querySelector('a[href*="/record/0-2/"], a[href*="/company/"]');
-        const m = (a?.getAttribute("href") ?? "").match(/(\d{5,})/);
-        return m ? m[1] : "";
-      }
-    });
-    return res?.result ?? "";
+  async function halt(storage2, state, reason) {
+    let report;
+    try {
+      report = await inspectList();
+    } catch {
+      report = void 0;
+    }
+    const next = { ...state, active: false, done: false, halted: true, haltReason: reason, probeReport: report };
+    await storage2.set("sweepState", next);
+    await chrome.alarms.clear(ALARM);
   }
-  async function clickNextPage(tabId, prevFirstId) {
-    const [res] = await chrome.scripting.executeScript({
-      target: { tabId },
-      func: async (prev) => {
-        const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-        const firstId = () => {
-          const a = document.querySelector('a[href*="/record/0-2/"], a[href*="/company/"]');
-          const m = (a?.getAttribute("href") ?? "").match(/(\d{5,})/);
-          return m ? m[1] : "";
-        };
-        const btns = [...document.querySelectorAll('button, a[role="button"]')];
-        const enabled = (b) => !b.disabled && b.getAttribute("aria-disabled") !== "true";
-        const next = btns.find((b) => /next( page)?/i.test(b.getAttribute("aria-label") ?? "") && enabled(b)) ?? btns.find((b) => /^next$/i.test((b.textContent ?? "").trim()) && enabled(b));
-        if (!next) return false;
-        next.click();
-        for (let i = 0; i < 20; i++) {
-          await sleep(400);
-          const id = firstId();
-          if (id !== "" && id !== prev) return true;
-        }
-        return false;
-      },
-      args: [prevFirstId]
-    });
-    return res?.result === true;
+  async function finish(storage2, state) {
+    await storage2.set("sweepState", { ...state, active: false, done: true });
+    await chrome.alarms.clear(ALARM);
   }
   async function sweepTick(bridge2, storage2) {
+    const now = Date.now();
+    let acquired = false;
+    await storage2.update("sweepState", (cur) => {
+      if (!cur || !cur.active || cur.done || cur.halted) return cur ?? null;
+      if (cur.tickLeaseUntil != null && cur.tickLeaseUntil > now) return cur;
+      acquired = true;
+      return { ...cur, tickLeaseUntil: now + TICK_LEASE_MS };
+    });
+    if (!acquired) {
+      const cur = await storage2.getOr("sweepState", null);
+      if (!cur || !cur.active || cur.done || cur.halted) await chrome.alarms.clear(ALARM);
+      return;
+    }
+    try {
+      await runTick(bridge2, storage2);
+    } finally {
+      await storage2.update("sweepState", (cur) => cur && cur.tickLeaseUntil != null ? { ...cur, tickLeaseUntil: void 0 } : cur ?? null);
+    }
+  }
+  async function runTick(bridge2, storage2) {
     let state = await storage2.getOr("sweepState", null);
-    if (!state || !state.active || state.done) {
+    if (!state || !state.active || state.done || state.halted) {
       await chrome.alarms.clear(ALARM);
       return;
     }
-    const tab = await findHubspotTab2();
+    const tab = await findHubspotTab3();
     if (!tab?.id) return;
-    const rows = await scrapeRows(tab.id);
-    state = { ...state, lastScrapeRows: rows.length, maxScrapeRows: Math.max(state.maxScrapeRows ?? 0, rows.length) };
+    const harvest = await harvestCurrentPage(tab.id, state.harvestMode, state.expectedPageSize);
+    const { rows, pager, mode, coverage } = harvest;
+    if (!harvest.pager.confident && rows.length === 0 && pager.source === "none") {
+      const ls = await readListState(tab.id);
+      if (!ls.scrollerFound && ls.renderedRowCount === 0) {
+        await storage2.set("sweepState", { ...state, lastScrapeRows: 0 });
+        return;
+      }
+    }
+    const fullyRendered = mode === "all-rendered" || mode === "classic-paginated";
+    const learnedPageSize = fullyRendered && pager.pageSize ? pager.pageSize : state.expectedPageSize;
+    const expectedPageSize = learnedPageSize ?? DEFAULT_PAGE_SIZE;
+    const firstRowId = rows[0]?.objectId ?? "";
+    const priorPage = state.hubspotPage;
+    const priorPageFirstId = state.pageFirstId;
+    state = {
+      ...state,
+      lastScrapeRows: rows.length,
+      maxScrapeRows: Math.max(state.maxScrapeRows ?? 0, rows.length),
+      hubspotPage: pager.page,
+      hubspotTotal: pager.total,
+      expectedPageSize,
+      // Pool baseline: anchor Z to the first confident read of this contiguous walk; re-anchor never (a
+      // change from here is the drift we must catch). Boundary signature: record the first id of THIS page
+      // only when starting it fresh (no signature yet), so a re-sort that keeps the page index is detectable.
+      poolTotalBaseline: state.poolTotalBaseline ?? (pager.total != null ? pager.total : void 0),
+      pageFirstId: state.pageFirstId ?? (firstRowId || void 0),
+      harvestMode: mode,
+      coverageRatio: expectedPageSize ? +(rows.length / expectedPageSize).toFixed(2) : void 0,
+      coverageStalls: coverage.underCovered ? (state.coverageStalls ?? 0) + 1 : 0
+    };
     await storage2.set("sweepState", state);
+    if (poolChanged(state.poolTotalBaseline, pager.total)) {
+      await halt(storage2, state, "pool-changed");
+      return;
+    }
+    if (pager.page != null && priorPage === pager.page && pageResorted(priorPageFirstId, firstRowId)) {
+      await halt(storage2, state, "page-resorted");
+      return;
+    }
+    const reconcile = reconcilePage(state.page + 1, pager);
     const dossier = await storage2.getOr("dossier", {});
     const now = Date.now();
     const mapped = rows.map(({ objectId, row }) => {
@@ -1649,7 +2452,22 @@
       }
       return { objectId, input, result: scoreAccount(input), researched };
     });
-    const nonResearch = mapped.filter((m) => !worthResearching(m.input, m.result.tier));
+    const isResearchable = (m) => worthResearching(m.input, m.result.tier) && !isFresh(dossier[dk(m.input.domain)], now);
+    const researchable = mapped.filter(isResearchable).map((m) => ({ objectId: m.objectId, domain: dk(m.input.domain), input: m.input }));
+    const researchRemaining = selectUnprocessed(researchable, new Set(state.processed), 1).length;
+    const action = nextSweepAction({ state, pageState: pager, mode, coverage, reconcile, researchRemaining });
+    if (action.kind === "halt") {
+      await halt(storage2, state, action.reason);
+      return;
+    }
+    if (action.kind === "wait") {
+      return;
+    }
+    if (action.kind === "finish") {
+      await finish(storage2, state);
+      return;
+    }
+    const nonResearch = mapped.filter((m) => !isResearchable(m));
     if (nonResearch.length) {
       const results = nonResearch.map((m) => toResult({
         objectId: m.objectId,
@@ -1665,61 +2483,66 @@
       state = recordResults(state, results, "WARM", keys);
       await storage2.set("sweepState", state);
     }
-    const researchable = mapped.filter((m) => worthResearching(m.input, m.result.tier)).map((m) => ({ objectId: m.objectId, domain: dk(m.input.domain), input: m.input }));
     const processedNow = new Set(state.processed);
     const newlyResearchable = researchable.filter((x) => !processedNow.has(sweepKey({ objectId: x.objectId, domain: x.domain }))).length;
     state = { ...state, researchableSeen: (state.researchableSeen ?? 0) + newlyResearchable };
     await storage2.set("sweepState", state);
-    for (let b = 0; b < BATCHES_PER_TICK; b++) {
-      const batch = selectUnprocessed(researchable, new Set(state.processed), BATCH_SIZE);
-      if (batch.length === 0) break;
-      const items = batch.map((x, i) => ({
-        ref: i + 1,
-        name: x.input.name ?? "",
-        domain: x.input.domain ?? "",
-        hints: { industry: x.input.industry ?? x.input.industryAlt, employees: x.input.employeeCount }
-      }));
-      const res = await bridge2.call(makeBatchResearchCall(items));
-      const scored = [];
-      if (res.ok && Array.isArray(res.value)) {
-        for (const it of res.value) {
-          const x = batch[it.ref - 1];
-          if (!x) continue;
-          const merged = mergeResearch(x.input, it.result).input;
-          const r = scoreAccount(merged);
-          scored.push(toResult({
-            objectId: x.objectId,
-            name: merged.name ?? "(no name)",
-            domain: merged.domain ?? x.domain,
-            tier: r.tier,
-            score: r.score,
-            signals: r.signals,
-            researchNote: merged.researchNote,
-            researched: true
-          }));
-          await storage2.update("dossier", (cur) => ({ ...cur ?? {}, [x.domain]: { domain: x.domain, researchedAt: Date.now(), result: it.result } }));
-        }
-      }
-      const keys = batch.map((x) => sweepKey({ objectId: x.objectId, domain: x.domain }));
-      state = recordResults(state, scored, "WARM", keys);
-      state = {
-        ...state,
-        batchesOk: (state.batchesOk ?? 0) + (res.ok ? 1 : 0),
-        batchesFailed: (state.batchesFailed ?? 0) + (res.ok ? 0 : 1),
-        lastFailure: res.ok ? state.lastFailure : res.failure ?? "unknown"
-      };
+    if (action.kind === "harvest") {
       await storage2.set("sweepState", state);
+      return;
     }
-    if (selectUnprocessed(researchable, new Set(state.processed), 1).length === 0) {
-      const prev = await firstRowId(tab.id);
-      const advanced = await clickNextPage(tab.id, prev);
-      if (advanced) {
-        state = { ...state, page: state.page + 1, pagesAdvanced: (state.pagesAdvanced ?? 0) + 1 };
+    if (action.kind === "research") {
+      state = await researchOneBatch(bridge2, storage2, state, researchable);
+      return;
+    }
+    if (action.kind === "advance") {
+      const before = pager;
+      const firstId = (await readListState(tab.id)).renderedRowIds[0] ?? "";
+      const raw = await clickPagerVerified(tab.id, { page: before.page, rangeStart: before.rangeStart, firstId });
+      const after = parsePageState(raw.pagerTexts, raw.pageInputValue);
+      const verdict = advanceVerdict(before, after, expectedPageSize);
+      if (verdict.kind === "advanced") {
+        const landed = await readListState(tab.id);
+        const processedSet = new Set(state.processed);
+        const newIds = landed.renderedRowIds.filter((id) => id !== "");
+        const overlap = newIds.filter((id) => processedSet.has(sweepKey({ objectId: id, domain: "" }))).length;
+        const ok = confirmAdvance({
+          expectedPage: before.page != null ? before.page + 1 : null,
+          observedPage: after.page,
+          newRowIds: newIds.length,
+          overlapWithProcessed: overlap
+        });
+        if (!ok.ok) {
+          await halt(storage2, state, ok.reason);
+          return;
+        }
+        state = {
+          ...state,
+          page: after.page != null ? after.page - 1 : state.page + 1,
+          // state.page is 0-based; pager.page is 1-based
+          pagesAdvanced: (state.pagesAdvanced ?? 0) + 1,
+          harvestMode: void 0,
+          coverageStalls: 0,
+          noMoveTicks: 0,
+          pageFirstId: void 0
+        };
         await storage2.set("sweepState", state);
+      } else if (verdict.kind === "skipped") {
+        await halt(storage2, state, "page-skip");
+      } else if (verdict.kind === "last-page") {
+        await finish(storage2, state);
       } else {
-        state = { ...state, active: false, done: true };
+        if (isLastPage(after) || isLastPage(before)) {
+          await finish(storage2, state);
+          return;
+        }
+        const noMoveTicks = (state.noMoveTicks ?? 0) + 1;
+        state = { ...state, noMoveTicks };
+        if (noMoveTicks >= MAX_NO_MOVE_TICKS) {
+          await halt(storage2, state, "unverifiable-advance");
+          return;
+        }
         await storage2.set("sweepState", state);
-        await chrome.alarms.clear(ALARM);
       }
     }
   }
@@ -2396,12 +3219,20 @@
       void scrapeHubspotDiag().then(sendResponse).catch((e) => sendResponse({ onHubspot: false, error: String(e?.message ?? e) }));
       return true;
     }
+    if (msg?.type === "INSPECT_LIST") {
+      void inspectList().then(sendResponse).catch((e) => sendResponse({ onHubspot: false, error: String(e?.message ?? e) }));
+      return true;
+    }
     if (msg?.type === "SOURCE_PREVIEW") {
       void previewSourcing(storage).then(sendResponse).catch((e) => sendResponse({ onHubspot: false, error: String(e?.message ?? e) }));
       return true;
     }
     if (msg?.type === "START_SWEEP") {
       void startSweep(storage).then(sendResponse).catch((e) => sendResponse({ error: String(e?.message ?? e) }));
+      return true;
+    }
+    if (msg?.type === "RESTART_SWEEP") {
+      void startSweep(storage, true).then(sendResponse).catch((e) => sendResponse({ error: String(e?.message ?? e) }));
       return true;
     }
     if (msg?.type === "RESUME_SWEEP") {
