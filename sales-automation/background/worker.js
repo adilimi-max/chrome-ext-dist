@@ -1881,7 +1881,7 @@
       mode = classifyHarvestMode(probe);
     }
     let rows;
-    if (mode === "virtualize") {
+    if (mode === "virtualize" || mode === "unknown") {
       rows = await virtualizeHarvest(tabId, expected);
     } else {
       rows = await readRenderedRows(tabId);
