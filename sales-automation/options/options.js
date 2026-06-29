@@ -131,8 +131,10 @@
     const phase = s.done ? "DONE" : s.active ? "RUNNING" : "STOPPED";
     const results = (s.results ?? []).slice().sort((a, b) => b.score - a.score);
     const research = `research: ${s.researchableSeen ?? 0} worth it \xB7 batches ok ${s.batchesOk ?? 0} / failed ${s.batchesFailed ?? 0}${s.lastFailure ? ` (last: ${s.lastFailure})` : ""} \xB7 ${s.researchedCount ?? 0} enriched`;
+    const coverage = `coverage: last scrape ${s.lastScrapeRows ?? 0} rows \xB7 max ${s.maxScrapeRows ?? 0} \xB7 pages advanced ${s.pagesAdvanced ?? 0}`;
     const head = `Sweep ${phase} \u2014 page ${(s.page ?? 0) + 1} \xB7 considered ${s.consideredCount ?? 0} \xB7 good-fit (WARM+) ${results.length}
-${research}`;
+${research}
+${coverage}`;
     const lines = results.slice(0, 50).map((r, i) => `${String(i + 1).padStart(2)}. [${r.tier}] ${r.score}  ${r.name}${r.researched ? " *" : ""}
       ${r.domain} \u2014 ${r.why}`);
     diag(`${head}

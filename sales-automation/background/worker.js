@@ -1635,6 +1635,8 @@
     const tab = await findHubspotTab2();
     if (!tab?.id) return;
     const rows = await scrapeRows(tab.id);
+    state = { ...state, lastScrapeRows: rows.length, maxScrapeRows: Math.max(state.maxScrapeRows ?? 0, rows.length) };
+    await storage2.set("sweepState", state);
     const dossier = await storage2.getOr("dossier", {});
     const now = Date.now();
     const mapped = rows.map(({ objectId, row }) => {
@@ -1712,7 +1714,7 @@
       const prev = await firstRowId(tab.id);
       const advanced = await clickNextPage(tab.id, prev);
       if (advanced) {
-        state = { ...state, page: state.page + 1 };
+        state = { ...state, page: state.page + 1, pagesAdvanced: (state.pagesAdvanced ?? 0) + 1 };
         await storage2.set("sweepState", state);
       } else {
         state = { ...state, active: false, done: true };
