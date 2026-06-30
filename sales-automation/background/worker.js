@@ -2344,7 +2344,10 @@
       batchSize: size,
       batchesOk: (next.batchesOk ?? 0) + (res.ok ? 1 : 0),
       batchesFailed: (next.batchesFailed ?? 0) + (res.ok ? 0 : 1),
-      lastFailure: res.ok ? next.lastFailure : res.failure ?? "unknown"
+      // CLEAR lastFailure on success. Otherwise a single timeout sticks forever and chooseBatchSize keeps
+      // halving every batch, ratcheting the size down to 1 permanently (defeating the batch token-saver).
+      // Clearing it lets the size settle at the first size that actually fits the bridge read window.
+      lastFailure: res.ok ? void 0 : res.failure ?? "unknown"
     };
     await storage2.set("sweepState", next);
     return next;
